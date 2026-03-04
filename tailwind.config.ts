@@ -63,6 +63,19 @@ export default {
         md: "calc(var(--radius) - 2px)",
         sm: "calc(var(--radius) - 4px)",
       },
+      fontFamily: {
+        sans: ['Inter', 'sans-serif'],
+        display: ['Space Grotesk', 'sans-serif'],
+      },
+      colors: {
+        "slot-available": "hsl(var(--slot-available))",
+        "slot-reserved": "hsl(var(--slot-reserved))",
+        "slot-occupied": "hsl(var(--slot-occupied))",
+      },
+      boxShadow: {
+        card: "var(--shadow-card)",
+        slot: "var(--shadow-slot)",
+      },
       keyframes: {
         "accordion-down": {
           from: {
