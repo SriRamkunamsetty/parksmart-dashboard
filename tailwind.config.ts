@@ -47,6 +47,9 @@ export default {
           DEFAULT: "hsl(var(--card))",
           foreground: "hsl(var(--card-foreground))",
         },
+        "slot-available": "hsl(var(--slot-available))",
+        "slot-reserved": "hsl(var(--slot-reserved))",
+        "slot-occupied": "hsl(var(--slot-occupied))",
         sidebar: {
           DEFAULT: "hsl(var(--sidebar-background))",
           foreground: "hsl(var(--sidebar-foreground))",
@@ -66,11 +69,6 @@ export default {
       fontFamily: {
         sans: ['Inter', 'sans-serif'],
         display: ['Space Grotesk', 'sans-serif'],
-      },
-      colors: {
-        "slot-available": "hsl(var(--slot-available))",
-        "slot-reserved": "hsl(var(--slot-reserved))",
-        "slot-occupied": "hsl(var(--slot-occupied))",
       },
       boxShadow: {
         card: "var(--shadow-card)",
