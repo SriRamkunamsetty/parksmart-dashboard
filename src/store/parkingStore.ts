@@ -29,10 +29,11 @@ interface ParkingStore {
   addBooking: (data: Omit<Booking, 'id' | 'bookingTime' | 'expiryTime' | 'status'>) => Booking;
   cancelBooking: (bookingId: string) => void;
   expireBooking: (bookingId: string) => void;
+  /** Called by useSlotPolling to merge live API data while preserving reserved slots */
+  syncSlotsFromApi: (apiSlots: ParkingSlot[]) => void;
 }
 
 const mockSlots = generateSlots();
-// Set a few as reserved for demo
 mockSlots[2].status = 'reserved';
 mockSlots[5].status = 'reserved';
 mockSlots[10].status = 'reserved';
@@ -137,5 +138,37 @@ export const useParkingStore = create<ParkingStore>((set, get) => ({
         s.id === booking.slotId ? { ...s, status: 'available' } : s
       ),
     }));
+  },
+
+  /**
+   * Merge API slot data. Slots that are locally 'reserved' (active bookings)
+   * are never overridden by the API to preserve UI consistency.
+   */
+  syncSlotsFromApi: (apiSlots) => {
+    const activeBookingSlotIds = new Set(
+      get().bookings.filter(b => b.status === 'active').map(b => b.slotId)
+    );
+    set((state) => {
+      // Build a map from the API response
+      const apiMap = new Map(apiSlots.map(s => [s.id, s]));
+      // If API returns different IDs/schema, replace entirely but protect reserved
+      const useApiDirectly = apiSlots.length > 0 && apiMap.has(apiSlots[0].id);
+      if (useApiDirectly) {
+        return {
+          slots: apiSlots.map(s =>
+            activeBookingSlotIds.has(s.id) ? { ...s, status: 'reserved' as const } : s
+          ),
+        };
+      }
+      // Fallback: just update statuses on existing slots
+      return {
+        slots: state.slots.map(s => {
+          const api = apiMap.get(s.id);
+          if (!api) return s;
+          if (activeBookingSlotIds.has(s.id)) return { ...s, status: 'reserved' as const };
+          return { ...s, status: api.status };
+        }),
+      };
+    });
   },
 }));

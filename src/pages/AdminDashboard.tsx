@@ -1,12 +1,16 @@
+import { useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useParkingStore } from '@/store/parkingStore';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { ParkingGrid } from '@/components/parking/ParkingGrid';
+import { ApiStatusBadge } from '@/components/parking/ApiStatusBadge';
+import { useSlotPolling } from '@/hooks/useSlotPolling';
 import {
   Car, LogOut, Users, CheckCircle, Clock, AlertCircle,
-  Download, BarChart3, TrendingUp,
+  Download, BarChart3, TrendingUp, RefreshCw,
 } from 'lucide-react';
+import { ParkingSlot } from '@/types/parking';
 
 const statusBadge = (status: string) => {
   const map: Record<string, string> = {
@@ -20,7 +24,10 @@ const statusBadge = (status: string) => {
 
 export default function AdminDashboard() {
   const navigate = useNavigate();
-  const { currentUser, slots, bookings, logout } = useParkingStore();
+  const { currentUser, slots, bookings, logout, syncSlotsFromApi } = useParkingStore();
+
+  const handleSlotsUpdate = useCallback((s: ParkingSlot[]) => syncSlotsFromApi(s), [syncSlotsFromApi]);
+  const { apiStatus, lastUpdated } = useSlotPolling(handleSlotsUpdate);
 
   if (!currentUser || currentUser.role !== 'admin') { navigate('/'); return null; }
 
@@ -36,10 +43,10 @@ export default function AdminDashboard() {
       b.customerName, b.phone, b.vehicleNumber, b.slotNumber,
       b.bookingTime.toLocaleString(), b.expiryTime.toLocaleString(), b.status,
     ]);
-    const csv = [headers, ...rows].map(r => r.join(',')).join('\n');
-    const blob = new Blob([csv], { type: 'text/csv' });
+    const csv = [headers, ...rows].map(r => r.map(v => `"${v}"`).join(',')).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
-    const a = document.createElement('a'); a.href = url; a.download = 'bookings.csv'; a.click();
+    const a = document.createElement('a'); a.href = url; a.download = 'parkings_bookings.csv'; a.click();
     URL.revokeObjectURL(url);
   };
 
@@ -67,6 +74,7 @@ export default function AdminDashboard() {
             </div>
           </div>
           <div className="flex items-center gap-3">
+            <ApiStatusBadge status={apiStatus} lastUpdated={lastUpdated} />
             <Badge variant="outline" className="gap-1.5 text-primary border-primary/30 bg-primary/5">
               <AlertCircle className="w-3 h-3" /> Admin
             </Badge>
@@ -101,7 +109,12 @@ export default function AdminDashboard() {
         <div className="bg-card rounded-2xl border border-border p-5 card-shadow">
           <div className="flex items-center justify-between mb-3">
             <h3 className="font-display font-semibold text-foreground">Slot Occupancy</h3>
-            <span className="text-sm text-muted-foreground">{total} total slots</span>
+            <div className="flex items-center gap-3">
+              <span className="text-sm text-muted-foreground">{total} total slots</span>
+              <span className="flex items-center gap-1 text-xs text-muted-foreground">
+                <RefreshCw className="w-3 h-3" /> every 5s
+              </span>
+            </div>
           </div>
           <div className="w-full h-4 rounded-full overflow-hidden bg-muted flex">
             <div
@@ -130,7 +143,7 @@ export default function AdminDashboard() {
         {/* Parking Grid */}
         <section>
           <h2 className="text-lg font-display font-bold text-foreground mb-4 flex items-center gap-2">
-            <Car className="w-5 h-5 text-primary" /> Parking Slot Monitor
+            <Car className="w-5 h-5 text-primary" /> Live Parking Slot Monitor
           </h2>
           <div className="bg-card rounded-2xl border border-border p-6 card-shadow">
             <ParkingGrid slots={slots} />
@@ -144,7 +157,7 @@ export default function AdminDashboard() {
               <Users className="w-5 h-5 text-primary" /> All Bookings
             </h2>
             <Button onClick={downloadCSV} variant="outline" className="gap-2 font-medium">
-              <Download className="w-4 h-4" /> Export Excel
+              <Download className="w-4 h-4" /> Export CSV
             </Button>
           </div>
 

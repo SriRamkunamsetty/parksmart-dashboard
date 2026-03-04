@@ -1,9 +1,11 @@
-import { useState } from 'react';
+import { useCallback, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useParkingStore } from '@/store/parkingStore';
 import { ParkingGrid } from '@/components/parking/ParkingGrid';
 import { BookingForm } from '@/components/parking/BookingForm';
 import { CountdownTimer } from '@/components/parking/CountdownTimer';
+import { ApiStatusBadge } from '@/components/parking/ApiStatusBadge';
+import { useSlotPolling } from '@/hooks/useSlotPolling';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Badge } from '@/components/ui/badge';
@@ -12,13 +14,16 @@ import { ParkingSlot } from '@/types/parking';
 
 export default function UserDashboard() {
   const navigate = useNavigate();
-  const { currentUser, slots, bookings, logout, cancelBooking, expireBooking } = useParkingStore();
+  const { currentUser, slots, bookings, logout, cancelBooking, expireBooking, syncSlotsFromApi } = useParkingStore();
   const [selectedSlot, setSelectedSlot] = useState<ParkingSlot | null>(null);
   const [bookingOpen, setBookingOpen] = useState(false);
 
+  const handleSlotsUpdate = useCallback((s: ParkingSlot[]) => syncSlotsFromApi(s), [syncSlotsFromApi]);
+  const { apiStatus, lastUpdated } = useSlotPolling(handleSlotsUpdate);
+
   if (!currentUser) { navigate('/'); return null; }
 
-  const myBookings = bookings.filter(b => b.customerName === currentUser.name || true).filter(b => b.status === 'active');
+  const myBookings = bookings.filter(b => b.status === 'active');
   const available = slots.filter(s => s.status === 'available').length;
   const reserved = slots.filter(s => s.status === 'reserved').length;
   const occupied = slots.filter(s => s.status === 'occupied').length;
@@ -45,6 +50,7 @@ export default function UserDashboard() {
             </div>
           </div>
           <div className="flex items-center gap-3">
+            <ApiStatusBadge status={apiStatus} lastUpdated={lastUpdated} />
             <span className="text-sm text-muted-foreground hidden sm:block">Hi, <strong className="text-foreground">{currentUser.name}</strong></span>
             <Button variant="outline" size="sm" onClick={() => { logout(); navigate('/'); }} className="gap-2">
               <LogOut className="w-4 h-4" /> Sign Out
@@ -116,6 +122,7 @@ export default function UserDashboard() {
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-lg font-display font-bold text-foreground flex items-center gap-2">
               <Car className="w-5 h-5 text-primary" /> Parking Slots
+              <span className="text-xs text-muted-foreground font-normal ml-1">· auto-refreshes every 5s</span>
             </h2>
             <Button
               onClick={() => setBookingOpen(true)}
