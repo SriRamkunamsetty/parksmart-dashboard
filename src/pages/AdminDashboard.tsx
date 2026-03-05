@@ -1,4 +1,4 @@
-import { useCallback } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useParkingStore } from '@/store/parkingStore';
 import { Button } from '@/components/ui/button';
@@ -8,9 +8,19 @@ import { ApiStatusBadge } from '@/components/parking/ApiStatusBadge';
 import { useSlotPolling } from '@/hooks/useSlotPolling';
 import {
   Car, LogOut, Users, CheckCircle, Clock, AlertCircle,
-  Download, BarChart3, TrendingUp, RefreshCw,
+  Download, BarChart3, TrendingUp, RefreshCw, Upload, Video, Loader2,
 } from 'lucide-react';
 import { ParkingSlot } from '@/types/parking';
+
+type UploadStatus = 'idle' | 'uploading' | 'analyzing' | 'done' | 'error';
+
+const uploadStatusConfig: Record<UploadStatus, { label: string; color: string }> = {
+  idle:      { label: 'Waiting for video upload',                                      color: 'text-muted-foreground' },
+  uploading: { label: 'Uploading video...',                                             color: 'text-yellow-600' },
+  analyzing: { label: 'Parking analysis started...',                                   color: 'text-blue-600' },
+  done:      { label: 'Parking video uploaded successfully. Analysis started.',         color: 'text-green-600' },
+  error:     { label: 'Upload failed. Please check the server and try again.',          color: 'text-destructive' },
+};
 
 const statusBadge = (status: string) => {
   const map: Record<string, string> = {
@@ -29,7 +39,51 @@ export default function AdminDashboard() {
   const handleSlotsUpdate = useCallback((s: ParkingSlot[]) => syncSlotsFromApi(s), [syncSlotsFromApi]);
   const { apiStatus, lastUpdated } = useSlotPolling(handleSlotsUpdate);
 
+  const [uploadStatus, setUploadStatus] = useState<UploadStatus>('idle');
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
   if (!currentUser || currentUser.role !== 'admin') { navigate('/'); return null; }
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0] ?? null;
+    setSelectedFile(file);
+    if (file) setUploadStatus('idle');
+  };
+
+  const handleUpload = async () => {
+    if (!selectedFile) return;
+    setUploadStatus('uploading');
+    setUploadProgress(0);
+
+    // Simulate progress ticks while uploading
+    const progressInterval = setInterval(() => {
+      setUploadProgress(prev => Math.min(prev + 10, 90));
+    }, 200);
+
+    try {
+      const formData = new FormData();
+      formData.append('file', selectedFile);
+
+      const res = await fetch('http://localhost:8000/upload-parking-video', {
+        method: 'POST',
+        body: formData,
+      });
+
+      clearInterval(progressInterval);
+      setUploadProgress(100);
+
+      if (!res.ok) throw new Error('Server error');
+
+      setUploadStatus('analyzing');
+      setTimeout(() => setUploadStatus('done'), 1500);
+    } catch {
+      clearInterval(progressInterval);
+      setUploadProgress(0);
+      setUploadStatus('error');
+    }
+  };
 
   const total = slots.length;
   const available = slots.filter(s => s.status === 'available').length;
@@ -139,6 +193,99 @@ export default function AdminDashboard() {
             <span className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-green-500" /> Available ({available})</span>
           </div>
         </div>
+
+        {/* Parking Video Analysis */}
+        <section>
+          <h2 className="text-lg font-display font-bold text-foreground mb-4 flex items-center gap-2">
+            <Video className="w-5 h-5 text-primary" /> Parking Video Analysis
+          </h2>
+          <div className="bg-card rounded-2xl border border-border p-6 card-shadow space-y-5">
+            {/* File input */}
+            <div className="space-y-1.5">
+              <label className="text-sm font-semibold text-foreground">Upload Parking Video</label>
+              <div
+                className="flex items-center gap-3 p-3 rounded-xl border-2 border-dashed border-border bg-muted/30 hover:bg-muted/50 transition-colors cursor-pointer"
+                onClick={() => fileInputRef.current?.click()}
+              >
+                <div className="w-9 h-9 rounded-lg bg-primary/10 flex items-center justify-center shrink-0">
+                  <Upload className="w-4 h-4 text-primary" />
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-medium text-foreground truncate">
+                    {selectedFile ? selectedFile.name : 'Choose a .mp4 file…'}
+                  </p>
+                  <p className="text-xs text-muted-foreground mt-0.5">
+                    Upload a parking lot video to automatically detect occupied parking slots.
+                  </p>
+                </div>
+                {selectedFile && (
+                  <span className="text-xs text-muted-foreground shrink-0">
+                    {(selectedFile.size / (1024 * 1024)).toFixed(1)} MB
+                  </span>
+                )}
+              </div>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="video/mp4"
+                className="hidden"
+                onChange={handleFileChange}
+              />
+            </div>
+
+            {/* Upload button + status row */}
+            <div className="flex flex-col sm:flex-row sm:items-center gap-4">
+              <Button
+                onClick={handleUpload}
+                disabled={!selectedFile || uploadStatus === 'uploading' || uploadStatus === 'analyzing'}
+                className="gap-2 font-medium"
+              >
+                {(uploadStatus === 'uploading' || uploadStatus === 'analyzing')
+                  ? <Loader2 className="w-4 h-4 animate-spin" />
+                  : <Upload className="w-4 h-4" />}
+                Upload &amp; Analyze Parking
+              </Button>
+
+              {/* Status indicator */}
+              <div className="flex items-center gap-2">
+                {(uploadStatus === 'uploading' || uploadStatus === 'analyzing') && (
+                  <Loader2 className="w-4 h-4 animate-spin text-primary shrink-0" />
+                )}
+                <span className={`text-sm font-medium ${uploadStatusConfig[uploadStatus].color}`}>
+                  {uploadStatusConfig[uploadStatus].label}
+                </span>
+              </div>
+            </div>
+
+            {/* Progress bar — visible during upload/analysis/done */}
+            {uploadStatus !== 'idle' && uploadStatus !== 'error' && (
+              <div className="space-y-1.5">
+                <div className="w-full h-2 rounded-full bg-muted overflow-hidden">
+                  <div
+                    className="h-full bg-primary rounded-full transition-all duration-300"
+                    style={{ width: `${uploadProgress}%` }}
+                  />
+                </div>
+                <div className="flex justify-between text-xs text-muted-foreground">
+                  <span>
+                    {uploadStatus === 'done' ? 'Slot grid will update automatically every 5s' : 'Processing…'}
+                  </span>
+                  <span>{uploadProgress}%</span>
+                </div>
+              </div>
+            )}
+
+            {/* Helper note when done */}
+            {uploadStatus === 'done' && (
+              <div className="flex items-start gap-2 p-3 rounded-xl bg-green-500/10 border border-green-500/20">
+                <CheckCircle className="w-4 h-4 text-green-600 mt-0.5 shrink-0" />
+                <p className="text-xs text-green-700 dark:text-green-400 leading-relaxed">
+                  Analysis is running. The parking slot grid below refreshes every 5 seconds and will reflect detected slot statuses automatically.
+                </p>
+              </div>
+            )}
+          </div>
+        </section>
 
         {/* Parking Grid */}
         <section>
