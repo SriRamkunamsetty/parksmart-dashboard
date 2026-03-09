@@ -20,7 +20,7 @@ from config import (
     FRAME_TIMEOUT_SEC, STREAM_DISCONNECT_TIMEOUT_SEC, 
     YOLO_VEHICLE_CLASS_IDS, QUEUE_BACKPRESSURE_THRESHOLD,
     SLOT_STATE_COOLDOWN_SEC, DEBUG_STREAM_ENABLED, MAX_STREAM_RETRIES,
-    TRACK_LOST_TIMEOUT
+    TRACK_LOST_TIMEOUT, EVENT_LOG_RETENTION_HOURS, TRACKER_MAP_DISTANCE_THRESHOLD
 )
 import collections
 from collections import deque
@@ -135,6 +135,8 @@ class SlotEvaluationAgent:
         self.slot_continuous_hits = {}
         self.cached_polygon_version = {} # slot_id -> version
         self.last_seen_tracks = {} # tracker_id -> timestamp
+        self.tracker_vehicle_map = {} # tracker_id -> vehicle_uuid
+        self.last_known_centroids = {} # vehicle_uuid -> (cx, cy, timestamp)
 
     def _get_or_build_cache(self, db, slots):
         for slot in slots:
@@ -165,6 +167,36 @@ class SlotEvaluationAgent:
         try:
             slots = db.query(ParkingSlot).all()
             self._get_or_build_cache(db, slots)
+            
+            # Correction 1 — Handle Tracker ID Switching
+            now_ts = time.time()
+            for d in detections:
+                tid = d.get("track_id")
+                if tid is not None:
+                    cx, cy = d["centroid"]
+                    if tid not in self.tracker_vehicle_map:
+                        # Try to find a nearby previous vehicle
+                        best_vid = None
+                        min_dist = TRACKER_MAP_DISTANCE_THRESHOLD
+                        
+                        for vid, (lcx, lcy, lts) in list(self.last_known_centroids.items()):
+                            if now_ts - lts < 10.0: # Only look back 10s
+                                dist = np.sqrt((cx - lcx)**2 + (cy - lcy)**2)
+                                if dist < min_dist:
+                                    min_dist = dist
+                                    best_vid = vid
+                        
+                        if best_vid:
+                            logging.info(f"[Identity] Re-mapped tracker {tid} to existing vehicle {best_vid}")
+                            self.tracker_vehicle_map[tid] = best_vid
+                        else:
+                            # Use new track id as vehicle id
+                            self.tracker_vehicle_map[tid] = str(tid)
+                    
+                    vid = self.tracker_vehicle_map[tid]
+                    self.last_known_centroids[vid] = (cx, cy, now_ts)
+                    # For session logging, we'll use this mapped vid
+                    d["vehicle_id"] = vid
             
             with slot_cache_lock:
                 target_slots_data = [(s, self.slot_bbox_cache[s.id]) for s in slots if s.id in self.slot_bbox_cache]
@@ -265,7 +297,7 @@ class SlotEvaluationAgent:
                                 # Start Session
                                 session = ParkingSession(
                                     slot_id=slot.id,
-                                    vehicle_id=str(found_track_id or "unknown"),
+                                    vehicle_id=str(v.get("vehicle_id") or found_track_id or "unknown"),
                                     entry_time=now_utc
                                 )
                                 db.add(session)
@@ -432,6 +464,7 @@ class ProcessingAgent(threading.Thread):
         self.detected_classes = {"car": 0, "truck": 0, "bus": 0, "motorcycle": 0}
         self.stream_source = "primary"
         self.stream_retry_count = 0
+        self.stream_status = "connected"
 
     def run(self):
         self.running = True
@@ -511,8 +544,12 @@ class ProcessingAgent(threading.Thread):
             processed_inferences += 1
             
             if not ret:
+                logging.error(f"[Pipeline] Stream broke for job {self.job_id}. Triggering failure cleanup.")
+                self.stream_status = "disconnected"
+                self._handle_stream_failure(db)
                 break
-                
+            
+            self.stream_status = "connected"
             self.worker_last_seen = time.time()
             self.last_heartbeat = time.time()
             self.frames_received += 1
@@ -636,6 +673,29 @@ class ProcessingAgent(threading.Thread):
             
         db.close()
 
+    def _handle_stream_failure(self, db):
+        try:
+            now_utc = datetime.now(timezone.utc)
+            active_sessions = db.query(ParkingSession).filter(ParkingSession.exit_time == None).all()
+            for session in active_sessions:
+                session.exit_time = now_utc
+                session.duration = (now_utc - session.entry_time).total_seconds()
+            slots = db.query(ParkingSlot).all()
+            for slot in slots:
+                if slot.status != "available":
+                    slot.status = "available"
+                    slot.last_status_change_at = now_utc
+                    slot.occupied_start_time = None
+            db.commit()
+            log_event("stream_failure", f"Stream failed. All sessions closed.")
+            asyncio.run_coroutine_threadsafe(
+                manager.broadcast({"event": "system_alert", "level": "error", "message": "Camera stream disconnected. Data reset."}),
+                asyncio.get_event_loop()
+            )
+        except Exception as e:
+            logging.error(f"Error in stream failure cleanup: {e}")
+            db.rollback()
+
 
 class JobManager:
     def __init__(self):
@@ -687,7 +747,12 @@ class JobManager:
         return FRAME_SKIP_DEFAULT
         
     def get_profiling_metrics(self):
+        import psutil
         for agent in self.active_jobs.values():
+            gpu_info = "N/A"
+            if torch.cuda.is_available():
+                gpu_info = f"{torch.cuda.get_device_name(0)} ({torch.cuda.memory_allocated(0)/1024**2:.1f}MB)"
+                
             return {
                 "decode_time_ms": agent.decode_time_ms,
                 "inference_time_ms": agent.inference_time_ms,
@@ -703,13 +768,20 @@ class JobManager:
                     "frames_dropped": agent.frames_dropped
                 },
                 "detected_classes": agent.detected_classes,
-                "stream_source": agent.stream_source
+                "stream_source": agent.stream_source,
+                "stream_status": getattr(agent, "stream_status", "unknown"),
+                "cpu_usage": psutil.cpu_percent(),
+                "memory_usage": psutil.virtual_memory().percent,
+                "gpu_usage": gpu_info
             }
         return {
             "decode_time_ms": 0, "inference_time_ms": 0, "slot_eval_time_ms": 0, "fps": 0, "queue_pressure": 0,
             "frame_stats": {"frames_received": 0, "frames_processed": 0, "frames_dropped": 0},
             "detected_classes": {"car": 0, "truck": 0, "bus": 0, "motorcycle": 0},
-            "stream_source": "none"
+            "stream_source": "none",
+            "cpu_usage": psutil.cpu_percent(),
+            "memory_usage": psutil.virtual_memory().percent,
+            "gpu_usage": "N/A"
         }
         
     def get_recent_metrics(self):

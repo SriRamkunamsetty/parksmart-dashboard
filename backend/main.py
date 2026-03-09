@@ -9,8 +9,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from database import engine, SessionLocal
 import models
-from models import ProcessingJob
-from config import MODEL_IMG_SIZE
+from models import ProcessingJob, ParkingSession, SystemEvent, ParkingSlot
+from config import MODEL_IMG_SIZE, EVENT_LOG_RETENTION_HOURS
 
 logging.basicConfig(
     level=logging.INFO, 
@@ -66,6 +66,8 @@ def system_health():
         "decode_time_ms": metrics["decode_time_ms"],
         "inference_time_ms": metrics["inference_time_ms"],
         "slot_eval_time_ms": metrics["slot_eval_time_ms"],
+        "gpu_usage": metrics.get("gpu_usage", "N/A"),
+        "stream_status": metrics.get("stream_status", "unknown")
     }
 
 @app.get("/api/system/settings")
@@ -107,6 +109,35 @@ def get_slots_utilization():
             }
             for s in slots
         ]
+    finally:
+        db.close()
+
+@app.get("/api/slots/live")
+def get_slots_live():
+    db = SessionLocal()
+    try:
+        slots = db.query(ParkingSlot).all()
+        result = []
+        now_utc = datetime.utcnow()
+        for s in slots:
+            session_duration = 0
+            vehicle_id = "unknown"
+            if s.status == "occupied":
+                active_session = db.query(ParkingSession).filter(
+                    ParkingSession.slot_id == s.id,
+                    ParkingSession.exit_time == None
+                ).first()
+                if active_session:
+                    vehicle_id = active_session.vehicle_id
+                    session_duration = (now_utc - active_session.entry_time).total_seconds()
+            
+            result.append({
+                "slot_id": s.id,
+                "status": s.status,
+                "vehicle_id": vehicle_id,
+                "session_duration_sec": round(session_duration, 2)
+            })
+        return result
     finally:
         db.close()
 
@@ -211,6 +242,20 @@ def cleanup_storage():
                     logging.info(f"Cleaned up {filename} (Disk: {disk_percent}%)")
                 except:
                     pass
+    
+    # Event Log Retention
+    db = SessionLocal()
+    try:
+        retention_limit = datetime.utcnow() - timedelta(hours=EVENT_LOG_RETENTION_HOURS)
+        deleted = db.query(SystemEvent).filter(SystemEvent.timestamp < retention_limit).delete()
+        if deleted > 0:
+            db.commit()
+            logging.info(f"Purged {deleted} old system events.")
+    except Exception as e:
+        logging.error(f"Event Log Cleanup Error: {e}")
+        db.rollback()
+    finally:
+        db.close()
 
 @app.on_event("startup")
 async def startup_event():
