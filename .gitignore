@@ -22,3 +22,14 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Python
+__pycache__/
+*.pyc
+
+# Project specific
+backend/uploads/
+*.mp4
+backend/data/
+Parking/
+*.pt

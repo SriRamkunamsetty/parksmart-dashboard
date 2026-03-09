@@ -6,6 +6,9 @@ export interface ParkingSlot {
   number: string;
   status: SlotStatus;
   floor: string;
+  polygon?: string;
+  polygon_configured?: boolean;
+  heatmap_count?: number;
 }
 
 export interface Booking {

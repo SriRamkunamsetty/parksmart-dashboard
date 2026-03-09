@@ -5,10 +5,44 @@ import logging
 import time
 import torch
 from database import SessionLocal
-from models import ParkingSlot
+from models import ParkingSlot, SystemState
 from collections import deque
+import threading
 
-logging.basicConfig(level=logging.INFO)
+def update_system_status(status_str: str):
+    try:
+        db = SessionLocal()
+        state = db.query(SystemState).first()
+        if not state:
+            state = SystemState(system_status=status_str)
+            db.add(state)
+        else:
+            state.system_status = status_str
+        db.commit()
+    except Exception as e:
+        logging.error(f"Failed to update system state: {e}")
+    finally:
+        db.close()
+
+analysis_lock = threading.Lock()
+
+def reset_all_slots_to_available():
+    try:
+        db = SessionLocal()
+        slots = db.query(ParkingSlot).all()
+        for slot in slots:
+            if slot.status != "reserved":
+                slot.status = "available"
+        db.commit()
+    except Exception as e:
+        logging.error(f"Failed to reset slots: {e}")
+    finally:
+        db.close()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(levelname)s] %(asctime)s - %(message)s"
+)
 
 # Global YOLO model loaded once on startup
 try:
@@ -56,14 +90,18 @@ def set_analysis_paused(paused: bool):
     analysis_paused = paused
     if paused:
         analysis_status["status"] = "stopped"
+        update_system_status("stopped")
     else:
         analysis_status["status"] = "processing"
+        update_system_status("processing")
 
 def get_video_stream():
     global latest_frame
+    logging.info("MJPEG stream requested")
     while True:
-        if analysis_status["status"] == "idle" or latest_frame is None:
-            time.sleep(1)
+        if latest_frame is None:
+            # Send a placeholder or just wait
+            time.sleep(0.1)
             continue
             
         ret, buffer = cv2.imencode('.jpg', latest_frame)
@@ -74,7 +112,7 @@ def get_video_stream():
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
         
-        time.sleep(0.03)
+        time.sleep(0.04) # ~25 FPS for streaming
 
 # Manual Polygon Calibration matching the real video feed
 SLOT_POLYGONS = {
@@ -91,11 +129,19 @@ SLOT_POLYGONS = {
 def process_video(video_path: str):
     global analysis_status, latest_frame, analysis_running, slot_detection_buffers
     
-    analysis_running = True
+    with analysis_lock:
+        if analysis_running:
+            logging.warning("Analysis already running. Ignoring multiple request.")
+            return
+        analysis_running = True
+        
     analysis_status["status"] = "processing"
+    cap = None
     
     try:
-        logging.info(f"Starting YOLOv8 parking detection on {video_path}...")
+        update_system_status("processing")
+        logging.info("Parking analysis started")
+        reset_all_slots_to_available()
     
         # Reset buffers and cooldowns on new video start
         for k in slot_detection_buffers.keys():
@@ -115,10 +161,16 @@ def process_video(video_path: str):
 
         frame_count = 0
         latest_results = None
+        last_frame_time = time.time()
     
         while True:
+            if not analysis_running:
+                logging.info("Analysis stopped manually.")
+                break
+                
             if analysis_paused:
                 time.sleep(1)
+                last_frame_time = time.time()
                 continue
                 
             ret, frame = cap.read()
@@ -127,16 +179,26 @@ def process_video(video_path: str):
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 continue
                 
+            last_frame_time = time.time()
             frame = cv2.resize(frame, (960, 540))
+            
+            # Update latest_frame IMMEDIATELY so stream is never black
+            if latest_frame is None:
+                latest_frame = frame.copy()
 
             frame_count += 1
             
-            # Only process YOLO on every 10th frame to save compute
-            if frame_count % 10 == 0 or latest_results is None:
-                # Optimize inference by omitting gradient trackers
-                with torch.no_grad():
-                    results = global_model.track(frame, persist=True, conf=0.4, verbose=False)
-                latest_results = results
+            # --- YOLO DETECTION SECTION (Every 3rd frame) ---
+            if frame_count % 3 == 0:
+            
+                if global_model is not None:
+                    # Optimize inference by omitting gradient trackers
+                    with torch.no_grad():
+                        results = global_model.track(frame, persist=True, conf=0.4, verbose=False)
+                    latest_results = results
+                else:
+                    logging.error("YOLO model not loaded. Skipping inference.")
+                    latest_results = None
             
                 detected_vehicles = []
                 slots_to_free = []
@@ -161,9 +223,10 @@ def process_video(video_path: str):
                             if box_area < 2000:
                                 continue
                                 
+                            # Need full bounding box to pass along for overlap detection
                             cx = int((x1 + x2) / 2)
                             cy = int((y1 + y2) / 2)
-                            detected_vehicles.append((cx, cy, track_id))
+                            detected_vehicles.append((cx, cy, track_id, (x1, y1, x2, y2)))
                             
                             # Exit line tracking
                             if track_id != -1:
@@ -176,12 +239,8 @@ def process_video(video_path: str):
                                 vehicle_track_y[track_id] = cy
                                 vehicle_last_seen_frame[track_id] = frame_count
 
-                # Cleanup tracks not seen for 30 frames
-                to_delete = [tid for tid, f in vehicle_last_seen_frame.items() if frame_count - f > 30]
-                for tid in to_delete:
-                    vehicle_track_y.pop(tid, None)
-                    vehicle_slot_assignment.pop(tid, None)
-                    vehicle_last_seen_frame.pop(tid, None)
+                if latest_results:
+                    logging.info(f"Frame {frame_count}: Detected {len(detected_vehicles)} vehicles")
                 
                 # Check DB
                 db = SessionLocal()
@@ -202,13 +261,33 @@ def process_video(video_path: str):
                             else:
                                 slot_cx, slot_cy = poly[0][0][0], poly[0][0][1]
                                 
+                            # Calculate slot bounding box and area
+                            slot_x, slot_y, slot_w, slot_h = cv2.boundingRect(poly)
+                            slot_area = cv2.contourArea(poly)
+                            if slot_area == 0: slot_area = 1 # Avoid division by zero
+                            
                             vehicle_in_poly = False
                             closest_dist = float('inf')
                             
                             # Find closest detecting box to slot center if multiple overlap
                             assigned_track_id = -1
-                            for (cx, cy, t_id) in detected_vehicles:
-                                if cv2.pointPolygonTest(poly, (cx, cy), False) >= 0:
+                            for (cx, cy, t_id, (vx1, vy1, vx2, vy2)) in detected_vehicles:
+                                # Calculate intersection area between the vehicle bounding box and the slot rectangle
+                                ix1 = max(vx1, slot_x)
+                                iy1 = max(vy1, slot_y)
+                                ix2 = min(vx2, slot_x + slot_w)
+                                iy2 = min(vy2, slot_y + slot_h)
+                                
+                                intersects = False
+                                if ix1 < ix2 and iy1 < iy2:
+                                    overlap_area = (ix2 - ix1) * (iy2 - iy1)
+                                    overlap_ratio = overlap_area / slot_area
+                                    
+                                    if overlap_ratio > 0.3: # Increased threshold for better stability
+                                        intersects = True
+                                        logging.info(f"Checking {slot.id}: Overlap ratio {overlap_ratio:.2f}")
+                                
+                                if intersects:
                                     dist = (cx - slot_cx)**2 + (cy - slot_cy)**2
                                     if dist < closest_dist:
                                         closest_dist = dist
@@ -251,7 +330,7 @@ def process_video(video_path: str):
                                         new_status = "available"
                                     
                                 if slot.status != new_status:
-                                    logging.info(f"Slot {slot.id} status changed from {slot.status} to {new_status}")
+                                    logging.info(f"Slot {slot.id} marked {new_status.upper()}")
                                     slot.status = new_status
                                     db_changed = True
                                     
@@ -270,21 +349,25 @@ def process_video(video_path: str):
                         
                     if db_changed:
                         db.commit()
+                        for slot in slots:
+                            db.refresh(slot)
                 except Exception as e:
                     logging.error(f"Detection loop DB error: {e}")
                 finally:
                     db.close()
 
-            # Draw UI on every frame using latest polygons and boxes
-            try:
-                db = SessionLocal()
-                slots = {s.id: s.status for s in db.query(ParkingSlot).all()}
-                db.close()
-            except:
-                slots = {}
-
+            # --- UI DRAWING SECTION (Every frame for fluidity) ---
             for slot_id, poly in SLOT_POLYGONS.items():
-                status = slots.get(slot_id, "available")
+                # We use a brief local DB check here to keep UI synced, but throttled
+                try:
+                    # In a production app, we'd use a shared state variable for 'slots' to avoid DB spam
+                    # But for this demo, direct DB check ensures consistency
+                    db_ui = SessionLocal()
+                    s_obj = db_ui.query(ParkingSlot).filter(ParkingSlot.id == slot_id).first()
+                    status = s_obj.status if s_obj else "available"
+                    db_ui.close()
+                except:
+                    status = "available"
                 
                 if status == "available":
                     color = (255, 0, 0)      # Blue
@@ -301,12 +384,9 @@ def process_video(video_path: str):
                 # Draw slot labels accurately at the centroid
                 poly_cx = int(np.mean(poly[:, 0, 0]))
                 poly_cy = int(np.mean(poly[:, 0, 1]))
-                # Adjust centroid text placement slightly to stay centered
                 (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                text_x = poly_cx - (text_w // 2)
-                text_y = poly_cy + (text_h // 2)
-                
-                cv2.putText(frame, label, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                cv2.putText(frame, label, (poly_cx - (text_w // 2), poly_cy + (text_h // 2)), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                 
             # Draw exit line
             cv2.line(frame, (0, EXIT_LINE_Y), (frame.shape[1], EXIT_LINE_Y), (0, 0, 255), 3)
@@ -320,31 +400,22 @@ def process_video(video_path: str):
                         
                         if cls_id in [2, 3, 5, 7] and conf >= 0.4:
                             x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
-                            
                             box_area = (x2 - x1) * (y2 - y1)
                             if box_area >= 2000:
                                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                                
-                                # Draw center point for debugging conditionally
-                                cx = int((x1 + x2) / 2)
-                                cy = int((y1 + y2) / 2)
-                                
-                                if DEBUG_MODE:
-                                    cv2.circle(frame, (cx, cy), 5, (0, 255, 255), -1)
-                                
-                                # Safely extract class name from global_model safely
                                 class_name = global_model.names.get(cls_id, "Vehicle") if global_model else "Vehicle"
-                                label = f"{class_name.upper()}"
-                                
-                                cv2.putText(frame, label, (x1, max(y1 - 10, 10)), 
+                                cv2.putText(frame, class_name.upper(), (x1, max(y1 - 10, 10)), 
                                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
                             
             latest_frame = frame.copy()
-            time.sleep(0.04) # Simulate 25fps real-time playback for the stream
+            time.sleep(0.01) # Small throttle
 
+    except Exception as e:
+        logging.error("YOLO processing failed", exc_info=True)
     finally:
-        if cap:
+        if cap is not None:
             cap.release()
-        analysis_status["status"] = "completed"
+        analysis_status["status"] = "idle"
         analysis_running = False
-        logging.info("Video processing completed.")
+        update_system_status("idle")
+        logging.info("Parking analysis completed")

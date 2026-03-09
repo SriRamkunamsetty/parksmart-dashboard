@@ -3,6 +3,7 @@ import datetime
 import logging
 from database import SessionLocal
 from models import Booking, ParkingSlot
+from websocket_manager import manager
 
 logging.basicConfig(level=logging.INFO)
 
@@ -23,6 +24,11 @@ def expire_bookings():
             if slot and slot.status == "reserved":
                 slot.status = "available"
                 logging.info(f"Slot {slot.id} is now available again.")
+                manager.sync_broadcast({
+                    "event": "slot_update",
+                    "slot_id": slot.id,
+                    "status": "available"
+                })
                 
         if expired_bookings:
             db.commit()

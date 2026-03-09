@@ -1,27 +1,29 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useParkingStore } from '@/store/parkingStore';
 import { ParkingGrid } from '@/components/parking/ParkingGrid';
 import { BookingForm } from '@/components/parking/BookingForm';
 import { CountdownTimer } from '@/components/parking/CountdownTimer';
-import { ApiStatusBadge } from '@/components/parking/ApiStatusBadge';
-import { useSlotPolling } from '@/hooks/useSlotPolling';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Badge } from '@/components/ui/badge';
-import { Car, LogOut, MapPin, Calendar, XCircle, PlusCircle } from 'lucide-react';
+import { Car, LogOut, MapPin, Calendar, XCircle, PlusCircle, Wifi } from 'lucide-react';
 import { ParkingSlot } from '@/types/parking';
 
 export default function UserDashboard() {
   const navigate = useNavigate();
-  const { currentUser, slots, bookings, logout, cancelBooking, expireBooking, syncSlotsFromApi } = useParkingStore();
+  const { currentUser, slots, bookings, ws, logout, cancelBooking, syncSlotsFromApi, fetchBookings, connectWebSocket } = useParkingStore();
   const [selectedSlot, setSelectedSlot] = useState<ParkingSlot | null>(null);
   const [bookingOpen, setBookingOpen] = useState(false);
 
-  const handleSlotsUpdate = useCallback((s: ParkingSlot[]) => syncSlotsFromApi(s), [syncSlotsFromApi]);
-  const { apiStatus, lastUpdated } = useSlotPolling(handleSlotsUpdate);
+  useEffect(() => {
+    if (!currentUser) { navigate('/'); return; }
+    connectWebSocket();
+    syncSlotsFromApi();
+    fetchBookings(currentUser.email);
+  }, [currentUser, navigate, connectWebSocket, syncSlotsFromApi, fetchBookings]);
 
-  if (!currentUser) { navigate('/'); return null; }
+  if (!currentUser) return null;
 
   const myBookings = bookings.filter(b => b.status === 'active');
   const available = slots.filter(s => s.status === 'available').length;
@@ -37,7 +39,6 @@ export default function UserDashboard() {
 
   return (
     <div className="min-h-screen bg-background">
-      {/* Header */}
       <header className="sticky top-0 z-40 border-b border-border bg-card/80 backdrop-blur-md">
         <div className="max-w-6xl mx-auto px-4 h-16 flex items-center justify-between">
           <div className="flex items-center gap-3">
@@ -50,7 +51,9 @@ export default function UserDashboard() {
             </div>
           </div>
           <div className="flex items-center gap-3">
-            <ApiStatusBadge status={apiStatus} lastUpdated={lastUpdated} />
+            <Badge variant="outline" className={`gap-1 hidden sm:flex ${ws?.readyState === WebSocket.OPEN ? 'text-green-600 border-green-200 bg-green-50' : 'text-yellow-600 border-yellow-200 bg-yellow-50'}`}>
+              <Wifi className="w-3 h-3" /> Live
+            </Badge>
             <span className="text-sm text-muted-foreground hidden sm:block">Hi, <strong className="text-foreground">{currentUser.name}</strong></span>
             <Button variant="outline" size="sm" onClick={() => { logout(); navigate('/'); }} className="gap-2">
               <LogOut className="w-4 h-4" /> Sign Out
@@ -60,7 +63,6 @@ export default function UserDashboard() {
       </header>
 
       <main className="max-w-6xl mx-auto px-4 py-8 space-y-8">
-        {/* Stats row */}
         <div className="grid grid-cols-3 gap-4">
           {[
             { label: 'Available', value: available, color: 'bg-green-50 border-green-200', text: 'text-green-700', dot: 'bg-green-500' },
@@ -77,7 +79,6 @@ export default function UserDashboard() {
           ))}
         </div>
 
-        {/* Active Bookings */}
         {myBookings.length > 0 && (
           <section>
             <h2 className="text-lg font-display font-bold text-foreground mb-4 flex items-center gap-2">
@@ -90,23 +91,23 @@ export default function UserDashboard() {
                     <div>
                       <div className="flex items-center gap-2 mb-1">
                         <MapPin className="w-4 h-4 text-primary" />
-                        <span className="font-display font-bold text-xl text-foreground">{booking.slotNumber}</span>
+                        <span className="font-display font-bold text-xl text-foreground">{booking.slotId}</span>
                         {statusBadge(booking.status)}
                       </div>
                       <p className="text-sm text-muted-foreground">Vehicle: <strong className="text-foreground">{booking.vehicleNumber}</strong></p>
-                      <p className="text-sm text-muted-foreground">Booked: {booking.bookingTime.toLocaleTimeString()}</p>
+                      <p className="text-sm text-muted-foreground">Booked: {new Date(booking.bookingTime).toLocaleTimeString()}</p>
                     </div>
                   </div>
 
                   <CountdownTimer
-                    expiryTime={booking.expiryTime}
-                    onExpire={() => expireBooking(booking.id)}
+                    expiryTime={new Date(booking.expiryTime)}
+                    onExpire={() => fetchBookings(currentUser.email)}
                   />
 
                   <Button
                     variant="outline"
                     size="sm"
-                    onClick={() => cancelBooking(booking.id)}
+                    onClick={() => cancelBooking(parseInt(booking.id))}
                     className="w-full gap-2 text-destructive border-destructive/30 hover:bg-destructive/10"
                   >
                     <XCircle className="w-4 h-4" /> Cancel Booking
@@ -117,12 +118,11 @@ export default function UserDashboard() {
           </section>
         )}
 
-        {/* Parking Grid */}
         <section>
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-lg font-display font-bold text-foreground flex items-center gap-2">
               <Car className="w-5 h-5 text-primary" /> Parking Slots
-              <span className="text-xs text-muted-foreground font-normal ml-1">· auto-refreshes every 5s</span>
+              <span className="text-xs text-muted-foreground font-normal ml-1">· Real-time Map</span>
             </h2>
             <Button
               onClick={() => setBookingOpen(true)}
@@ -142,7 +142,6 @@ export default function UserDashboard() {
         </section>
       </main>
 
-      {/* Booking Dialog */}
       <Dialog open={bookingOpen} onOpenChange={setBookingOpen}>
         <DialogContent className="max-w-md">
           <DialogHeader>

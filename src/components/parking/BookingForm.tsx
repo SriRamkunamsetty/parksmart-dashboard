@@ -5,7 +5,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { CheckCircle } from 'lucide-react';
+import { CheckCircle, Loader2 } from 'lucide-react';
 
 interface BookingFormProps {
   slots: ParkingSlot[];
@@ -14,32 +14,31 @@ interface BookingFormProps {
 }
 
 export function BookingForm({ slots, selectedSlot, onSuccess }: BookingFormProps) {
-  const { addBooking, currentUser } = useParkingStore();
+  const { bookSlot, currentUser } = useParkingStore();
   const [form, setForm] = useState({
-    customerName: currentUser?.name || '',
-    phone: '',
-    vehicleNumber: '',
-    slotId: selectedSlot?.id || '',
+    name: currentUser?.name || '',
+    phone: currentUser?.email || '', // Using email placeholder for phone temporarily to fit demo mock
+    vehicle_number: '',
+    slot_id: selectedSlot?.id || '',
   });
   const [submitted, setSubmitted] = useState(false);
+  const [loading, setLoading] = useState(false);
 
   const availableSlots = slots.filter(s => s.status === 'available');
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    const slot = slots.find(s => s.id === form.slotId);
+    const slot = slots.find(s => s.id === form.slot_id);
     if (!slot) return;
-    addBooking({
-      customerName: form.customerName,
-      phone: form.phone,
-      vehicleNumber: form.vehicleNumber,
-      slotId: slot.id,
-      slotNumber: slot.number,
-    });
-    setSubmitted(true);
-    setTimeout(() => {
-      onSuccess();
-    }, 1500);
+    setLoading(true);
+    const success = await bookSlot(form);
+    setLoading(false);
+    if (success) {
+      setSubmitted(true);
+      setTimeout(() => {
+        onSuccess();
+      }, 1500);
+    }
   };
 
   if (submitted) {
@@ -49,7 +48,7 @@ export function BookingForm({ slots, selectedSlot, onSuccess }: BookingFormProps
           <CheckCircle className="w-8 h-8 text-green-600" />
         </div>
         <h3 className="text-xl font-display font-bold text-foreground">Booking Confirmed!</h3>
-        <p className="text-muted-foreground text-sm text-center">Your slot has been reserved for 15 minutes.</p>
+        <p className="text-muted-foreground text-sm text-center">Your slot has been reserved for 10 minutes.</p>
       </div>
     );
   }
@@ -57,17 +56,17 @@ export function BookingForm({ slots, selectedSlot, onSuccess }: BookingFormProps
   return (
     <form onSubmit={handleSubmit} className="space-y-4">
       <div className="space-y-1.5">
-        <Label htmlFor="customerName">Customer Name</Label>
+        <Label htmlFor="name">Customer Name</Label>
         <Input
-          id="customerName"
+          id="name"
           placeholder="John Smith"
-          value={form.customerName}
-          onChange={e => setForm(f => ({ ...f, customerName: e.target.value }))}
+          value={form.name}
+          onChange={e => setForm(f => ({ ...f, name: e.target.value }))}
           required
         />
       </div>
       <div className="space-y-1.5">
-        <Label htmlFor="phone">Phone Number</Label>
+        <Label htmlFor="phone">Phone Number (Required for History check)</Label>
         <Input
           id="phone"
           placeholder="+1 (555) 000-0000"
@@ -77,20 +76,20 @@ export function BookingForm({ slots, selectedSlot, onSuccess }: BookingFormProps
         />
       </div>
       <div className="space-y-1.5">
-        <Label htmlFor="vehicleNumber">Vehicle Number</Label>
+        <Label htmlFor="vehicle_number">Vehicle Number</Label>
         <Input
-          id="vehicleNumber"
+          id="vehicle_number"
           placeholder="ABC-1234"
-          value={form.vehicleNumber}
-          onChange={e => setForm(f => ({ ...f, vehicleNumber: e.target.value }))}
+          value={form.vehicle_number}
+          onChange={e => setForm(f => ({ ...f, vehicle_number: e.target.value }))}
           required
         />
       </div>
       <div className="space-y-1.5">
         <Label>Parking Slot</Label>
         <Select
-          value={form.slotId}
-          onValueChange={v => setForm(f => ({ ...f, slotId: v }))}
+          value={form.slot_id}
+          onValueChange={v => setForm(f => ({ ...f, slot_id: v }))}
           required
         >
           <SelectTrigger>
@@ -113,9 +112,9 @@ export function BookingForm({ slots, selectedSlot, onSuccess }: BookingFormProps
         type="submit"
         className="w-full h-11 font-semibold"
         style={{ background: 'var(--gradient-hero)', border: 'none' }}
-        disabled={!form.slotId}
+        disabled={!form.slot_id || loading}
       >
-        Confirm Booking
+        {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Confirm Booking'}
       </Button>
     </form>
   );
