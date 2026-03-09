@@ -78,6 +78,9 @@ def delete_slot(slot_id: str, db: Session = Depends(get_db)):
     slot.polygon = None
     slot.polygon_configured = 0
     slot.status = "available"
+    slot.occupancy_count = 0
+    slot.total_occupied_time = 0.0
+    slot.occupied_start_time = None
     db.commit()
     
     manager.sync_broadcast({
@@ -101,7 +104,10 @@ def reseed_slots(db: Session = Depends(get_db)):
                 floor="S", 
                 status="available", 
                 polygon=None,
-                polygon_configured=0
+                polygon_configured=0,
+                occupancy_count=0,
+                total_occupied_time=0.0,
+                occupied_start_time=None
             )
             db.add(new_slot)
             count += 1

@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 
 from database import SessionLocal
 from database import SessionLocal
-from models import ParkingSlot, ProcessingJob
+from models import ParkingSlot, ProcessingJob, ParkingSession
 from websocket_manager import manager
 from config import (
     MODEL_PATH, MODEL_IMG_SIZE, FRAME_SKIP_DEFAULT, MAX_WORKERS, 
@@ -19,7 +19,7 @@ from config import (
     PROCESSING_FPS_WINDOW, MIN_POLYGON_AREA, FRAME_HASH_SIZE, 
     FRAME_TIMEOUT_SEC, STREAM_DISCONNECT_TIMEOUT_SEC, 
     YOLO_VEHICLE_CLASS_IDS, QUEUE_BACKPRESSURE_THRESHOLD,
-    SLOT_STATE_COOLDOWN_SEC, DEBUG_STREAM_ENABLED
+    SLOT_STATE_COOLDOWN_SEC, DEBUG_STREAM_ENABLED, MAX_STREAM_RETRIES
 )
 import collections
 from collections import deque
@@ -39,6 +39,7 @@ stream_reconnect_lock = threading.Lock() # Ensure single reconnection thread
 recent_profiling_metrics = deque(maxlen=QUEUE_LIMIT)
 fps_rolling_window = deque(maxlen=PROCESSING_FPS_WINDOW)
 detection_fps_window = deque(maxlen=PROCESSING_FPS_WINDOW)
+system_mode = "NORMAL" # NORMAL | SAFE_MODE
 
 def get_model():
     global _global_model_instance
@@ -132,6 +133,7 @@ class SlotEvaluationAgent:
             for slot, cache_data in target_slots_data:
                 x, y, w, h, area, poly = cache_data
                 vehicle_in_slot = False
+                found_track_id = None
                 
                 for v in detections:
                     vx1, vy1, vx2, vy2 = v["bbox"]
@@ -162,6 +164,7 @@ class SlotEvaluationAgent:
                         if DEBUG_PIPELINE:
                             logging.debug(f"[SlotEval] Centroid ({cx},{cy}) inside polygon for slot {slot.id} (S{slot.number}) -> OCCUPIED")
                         vehicle_in_slot = True
+                        found_track_id = v.get("track_id")
                         break
                 
                 if DEBUG_PIPELINE and DEBUG_STREAM_ENABLED and poly is not None and len(poly) > 0 and eval_frame is not None:
@@ -208,13 +211,30 @@ class SlotEvaluationAgent:
 
                         logging.info(f"Updating slot {slot.id} (S{slot.number}) status: {slot.status} -> {pending_state}")
                         
-                        # Utilization Analytics
-                        if pending_state == "occupied":
+                        # Utilization Analytics & Session Logging
+                        if pending_state == "occupied" and slot.status != "occupied":
                             slot.occupancy_count = (slot.occupancy_count or 0) + 1
+                            slot.occupied_start_time = now_utc
+                            # Start Session
+                            session = ParkingSession(
+                                slot_id=slot.id,
+                                vehicle_id=str(found_track_id or "unknown"),
+                                entry_time=now_utc
+                            )
+                            db.add(session)
                         elif slot.status == "occupied" and pending_state == "available":
                             if slot.last_status_change_at:
                                 duration = (now_utc - slot.last_status_change_at.replace(tzinfo=timezone.utc)).total_seconds()
                                 slot.total_occupied_time = (slot.total_occupied_time or 0.0) + duration
+                            # End Session
+                            latest_session = db.query(ParkingSession).filter(
+                                ParkingSession.slot_id == slot.id,
+                                ParkingSession.exit_time == None
+                            ).order_by(ParkingSession.entry_time.desc()).first()
+                            if latest_session:
+                                latest_session.exit_time = now_utc
+                                latest_session.duration = (now_utc - latest_session.entry_time).total_seconds()
+                            slot.occupied_start_time = None
                         
                         slot.status = pending_state
                         slot.last_status_change_at = now_utc
@@ -236,31 +256,49 @@ class SlotEvaluationAgent:
         finally:
             db.close()
 
-class DetectionAgent:
     @staticmethod
     def process(frame):
         model = get_model()
         if model is None:
             return []
         
+        # Strict Lock Ordering: slot_cache_lock -> frame_queue_lock -> inference_lock
+        # We only need inference_lock here, but we honor the ordering principle
+        # by not having higher locks if we were to grab them.
         with inference_lock:
             with torch.no_grad():
-                results = model.predict(frame, imgsz=MODEL_IMG_SIZE, verbose=False)
+                results = model.track(frame, persist=True, imgsz=MODEL_IMG_SIZE, verbose=False, classes=YOLO_VEHICLE_CLASS_IDS, conf=CONFIDENCE_THRESHOLD)
             
         detections = []
         for r in results:
-            for box in r.boxes:
-                cls_id = int(box.cls[0])
-                conf = float(box.conf[0])
-                if cls_id in YOLO_VEHICLE_CLASS_IDS and conf >= CONFIDENCE_THRESHOLD:
+            if r.boxes.id is not None:
+                ids = r.boxes.id.cpu().numpy().astype(int)
+                for box, track_id in zip(r.boxes, ids):
+                    cls_id = int(box.cls[0])
+                    conf = float(box.conf[0])
                     x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
                     cx = int((x1 + x2) / 2)
                     cy = int((y1 + y2) / 2)
                     detections.append({
                         "bbox": (x1, y1, x2, y2),
                         "centroid": (cx, cy),
-                        "class_id": cls_id
+                        "class_id": cls_id,
+                        "track_id": track_id
                     })
+            else:
+                for box in r.boxes:
+                    cls_id = int(box.cls[0])
+                    conf = float(box.conf[0])
+                    if cls_id in YOLO_VEHICLE_CLASS_IDS and conf >= CONFIDENCE_THRESHOLD:
+                        x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
+                        cx = int((x1 + x2) / 2)
+                        cy = int((y1 + y2) / 2)
+                        detections.append({
+                            "bbox": (x1, y1, x2, y2),
+                            "centroid": (cx, cy),
+                            "class_id": cls_id,
+                            "track_id": None
+                        })
         return detections
 
 class ProcessingAgent(threading.Thread):
@@ -280,11 +318,13 @@ class ProcessingAgent(threading.Thread):
         self.slot_eval_time_ms = 0
         self.latency_window = deque(maxlen=20)
         self.worker_last_seen = time.time()
+        self.last_heartbeat = time.time()
         self.frames_received = 0
         self.frames_processed = 0
         self.frames_dropped = 0
         self.detected_classes = {"car": 0, "truck": 0, "bus": 0, "motorcycle": 0}
         self.stream_source = "primary"
+        self.stream_retry_count = 0
 
     def run(self):
         self.running = True
@@ -300,15 +340,21 @@ class ProcessingAgent(threading.Thread):
         job = db.query(ProcessingJob).filter(ProcessingJob.id == self.db_id).first()
         if not job or job.status == "cancelled":
             db.close()
-            return
-
         while self.running:
+            self.last_heartbeat = time.time()
             with stream_reconnect_lock:
                 cap = cv2.VideoCapture(job.video_path)
                 if cap.isOpened():
+                    self.stream_retry_count = 0
                     break
             
-            logging.warning(f"Failed to open stream/file {job.video_path}. Retrying in 5 seconds...")
+            self.stream_retry_count += 1
+            if self.stream_retry_count > MAX_STREAM_RETRIES:
+                global system_mode
+                system_mode = "SAFE_MODE"
+                logging.error(f"Stream reconnection failed after {MAX_STREAM_RETRIES} attempts. SYSTEM_MODE -> SAFE_MODE")
+            
+            logging.warning(f"Failed to open stream/file {job.video_path} (Attempt {self.stream_retry_count}). Retrying in 5 seconds...")
             await asyncio.sleep(5)
             job = db.query(ProcessingJob).filter(ProcessingJob.id == self.db_id).first()
             if not job or job.status == "cancelled":
@@ -360,11 +406,13 @@ class ProcessingAgent(threading.Thread):
                 break
                 
             self.worker_last_seen = time.time()
+            self.last_heartbeat = time.time()
             self.frames_received += 1
             
             # Frame queue pressure simulation/tracking
-            self.frame_queue.append(time.time())
-            self.queue_pressure = len(self.frame_queue) / QUEUE_LIMIT
+            with frame_queue_lock:
+                self.frame_queue.append(time.time())
+                self.queue_pressure = len(self.frame_queue) / QUEUE_LIMIT
             
             # Dropped frames logic (if queue was overflowing, but here we process sequentially)
             # In a real producer-consumer, we'd pop oldest if queue full.
@@ -489,15 +537,21 @@ class JobManager:
         
     def _monitor_heartbeats(self):
         while True:
-            time.sleep(5)
+            time.sleep(10) # 10s check interval
             dead_workers = []
             current_time = time.time()
             for db_id, agent in list(self.active_jobs.items()):
-                if agent.running and not agent.paused:
-                    if (current_time - agent.worker_last_seen) > 10.0:
-                        dead_workers.append((db_id, getattr(agent, 'job_id', 'unknown')))
+                # Watchdog: Restart if heartbeat missing > 30s
+                is_stale = (current_time - agent.last_heartbeat) > 30.0
+                if agent.running and not agent.paused and is_stale:
+                    logging.warning(f"Watchdog: Worker {agent.job_id} heartbeat timeout! Restarting thread.")
+                    dead_workers.append((db_id, getattr(agent, 'job_id', 'unknown')))
+                elif agent.running and not agent.paused and (current_time - agent.worker_last_seen) > 60.0:
+                    # Fallback for general deadlock
+                    logging.warning(f"Watchdog: Worker {agent.job_id} last seen > 60s! Restarting.")
+                    dead_workers.append((db_id, getattr(agent, 'job_id', 'unknown')))
+                    
             for db_id, j_id in dead_workers:
-                logging.warning(f"Worker {j_id} (DB {db_id}) exceeded 10.0s heartbeat! Terminating and restarting.")
                 self.cancel_job(db_id)
                 self.resume_job(db_id)
         

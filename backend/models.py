@@ -15,7 +15,18 @@ class ParkingSlot(Base):
     last_status_change_at = Column(DateTime, default=datetime.datetime.utcnow)
     occupancy_count = Column(Integer, default=0)
     total_occupied_time = Column(Float, default=0.0) # In seconds
+    occupied_start_time = Column(DateTime, nullable=True)
     heatmap_count = Column(Integer, default=0)
+
+class ParkingSession(Base):
+    __tablename__ = "parking_sessions"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    vehicle_id = Column(String(100))
+    slot_id = Column(String(50))
+    entry_time = Column(DateTime, default=datetime.datetime.utcnow)
+    exit_time = Column(DateTime, nullable=True)
+    duration = Column(Float, nullable=True) # In seconds
 
 class Booking(Base):
     __tablename__ = "bookings"
