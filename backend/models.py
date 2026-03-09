@@ -13,6 +13,8 @@ class ParkingSlot(Base):
     polygon_configured = Column(Integer, default=0) # Using Integer as boolean for SQLite compatibility
     polygon_version = Column(Integer, default=1)
     last_status_change_at = Column(DateTime, default=datetime.datetime.utcnow)
+    occupancy_count = Column(Integer, default=0)
+    total_occupied_time = Column(Float, default=0.0) # In seconds
     heatmap_count = Column(Integer, default=0)
 
 class Booking(Base):

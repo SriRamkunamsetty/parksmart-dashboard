@@ -58,6 +58,7 @@ def system_health():
         "frame_queue_pressure": metrics["queue_pressure"],
         "frame_processing_time_avg": metrics["frame_processing_time_avg"],
         "frame_processing_time_max": metrics["frame_processing_time_max"],
+        "detection_fps": metrics["detection_fps"],
         "frame_stats": metrics["frame_stats"],
         "detected_classes": metrics["detected_classes"],
         "stream_source": metrics["stream_source"],
@@ -76,6 +77,24 @@ async def websocket_endpoint(websocket: WebSocket):
             data = await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)
+
+@app.get("/api/slots/utilization")
+def get_slots_utilization():
+    db = SessionLocal()
+    try:
+        slots = db.query(models.ParkingSlot).all()
+        return [
+            {
+                "id": s.id,
+                "number": s.number,
+                "occupancy_count": s.occupancy_count or 0,
+                "total_occupied_time_sec": round(s.total_occupied_time or 0.0, 2),
+                "heatmap_count": s.heatmap_count or 0
+            }
+            for s in slots
+        ]
+    finally:
+        db.close()
 
 def initialize_db():
     db = SessionLocal()

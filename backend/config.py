@@ -25,6 +25,7 @@ SLOT_STATE_COOLDOWN_SEC = 1
 # Stream Sources
 PRIMARY_STREAM_URL = os.getenv("PRIMARY_STREAM_URL", "")
 FALLBACK_STREAM_URL = os.getenv("FALLBACK_STREAM_URL", "")
+DEBUG_STREAM_ENABLED = os.getenv("DEBUG_STREAM_ENABLED", "True").lower() == "true"
 
 ALLOWED_VEHICLE_CLASSES = ["car", "truck", "bus", "motorcycle"]
 YOLO_VEHICLE_CLASS_IDS = [2, 3, 5, 7] # COCO: car, motorcycle, bus, truck

@@ -19,7 +19,7 @@ from config import (
     PROCESSING_FPS_WINDOW, MIN_POLYGON_AREA, FRAME_HASH_SIZE, 
     FRAME_TIMEOUT_SEC, STREAM_DISCONNECT_TIMEOUT_SEC, 
     YOLO_VEHICLE_CLASS_IDS, QUEUE_BACKPRESSURE_THRESHOLD,
-    SLOT_STATE_COOLDOWN_SEC
+    SLOT_STATE_COOLDOWN_SEC, DEBUG_STREAM_ENABLED
 )
 import collections
 from collections import deque
@@ -33,8 +33,12 @@ _global_model_instance = None
 _model_lock = threading.Lock()
 inference_lock = threading.Lock()
 frame_buffer_lock = threading.Lock() # Guard for shared MJPEG buffer
+slot_cache_lock = threading.Lock()   # Guard for geometry and bbox caches
+frame_queue_lock = threading.Lock()   # Guard for frame queue push/pop
+stream_reconnect_lock = threading.Lock() # Ensure single reconnection thread
 recent_profiling_metrics = deque(maxlen=QUEUE_LIMIT)
 fps_rolling_window = deque(maxlen=PROCESSING_FPS_WINDOW)
+detection_fps_window = deque(maxlen=PROCESSING_FPS_WINDOW)
 
 def get_model():
     global _global_model_instance
@@ -98,17 +102,23 @@ class SlotEvaluationAgent:
             needs_rebuild = slot.id not in self.slot_bbox_cache or \
                            self.cached_polygon_version.get(slot.id) != slot.polygon_version
             
-            if needs_rebuild and slot.polygon and slot.polygon != "[]":
-                try:
-                    pts = json.loads(slot.polygon)
-                    if len(pts) >= 3:
-                        poly = np.array(pts, np.int32).reshape((-1, 1, 2))
-                        x, y, w, h = cv2.boundingRect(poly)
-                        area = cv2.contourArea(poly) or 1
-                        self.slot_bbox_cache[slot.id] = (x, y, w, h, area, poly)
-                        self.cached_polygon_version[slot.id] = slot.polygon_version
-                except Exception as e:
-                    logging.error(f"Polygon parse error for {slot.id}: {e}")
+            if needs_rebuild:
+                # Immediate hit buffer reset on geometry change per exact specifications
+                if slot.id in self.slot_continuous_hits:
+                    self.slot_continuous_hits[slot.id] = 0
+                
+                if slot.polygon and slot.polygon != "[]":
+                    try:
+                        pts = json.loads(slot.polygon)
+                        if len(pts) >= 3:
+                            poly = np.array(pts, np.int32).reshape((-1, 1, 2))
+                            x, y, w, h = cv2.boundingRect(poly)
+                            area = cv2.contourArea(poly) or 1
+                            with slot_cache_lock:
+                                self.slot_bbox_cache[slot.id] = (x, y, w, h, area, poly)
+                                self.cached_polygon_version[slot.id] = slot.polygon_version
+                    except Exception as e:
+                        logging.error(f"Polygon parse error for {slot.id}: {e}")
                     
     def evaluate(self, detections, current_timestamp: float, eval_frame=None):
         db = SessionLocal()
@@ -116,11 +126,11 @@ class SlotEvaluationAgent:
             slots = db.query(ParkingSlot).all()
             self._get_or_build_cache(db, slots)
             
-            for slot in slots:
-                if slot.id not in self.slot_bbox_cache:
-                    continue
-                    
-                x, y, w, h, area, poly = self.slot_bbox_cache[slot.id]
+            with slot_cache_lock:
+                target_slots_data = [(s, self.slot_bbox_cache[s.id]) for s in slots if s.id in self.slot_bbox_cache]
+                
+            for slot, cache_data in target_slots_data:
+                x, y, w, h, area, poly = cache_data
                 vehicle_in_slot = False
                 
                 for v in detections:
@@ -130,7 +140,7 @@ class SlotEvaluationAgent:
                         
                     cx, cy = v["centroid"]
                     
-                    if DEBUG_PIPELINE and eval_frame is not None:
+                    if DEBUG_PIPELINE and DEBUG_STREAM_ENABLED and eval_frame is not None:
                         cv2.rectangle(eval_frame, (vx1, vy1), (vx2, vy2), (255, 0, 0), 2) # Blue bbox
                         cv2.circle(eval_frame, (cx, cy), 4, (0, 0, 255), -1) # Red centroid
                         
@@ -154,8 +164,10 @@ class SlotEvaluationAgent:
                         vehicle_in_slot = True
                         break
                 
-                if DEBUG_PIPELINE and poly is not None and len(poly) > 0 and eval_frame is not None:
-                    cv2.polylines(eval_frame, [poly], isClosed=True, color=(0, 255, 0), thickness=2) # Green polygon
+                if DEBUG_PIPELINE and DEBUG_STREAM_ENABLED and poly is not None and len(poly) > 0 and eval_frame is not None:
+                    # Drawing polylines already happens outside this loop for all slots if enabled,
+                    # but we keep this for specific per-slot highlights if needed later.
+                    pass
                 
                 if vehicle_in_slot:
                     self.slot_continuous_hits[slot.id] = self.slot_continuous_hits.get(slot.id, 0) + 1
@@ -195,6 +207,15 @@ class SlotEvaluationAgent:
                             continue
 
                         logging.info(f"Updating slot {slot.id} (S{slot.number}) status: {slot.status} -> {pending_state}")
+                        
+                        # Utilization Analytics
+                        if pending_state == "occupied":
+                            slot.occupancy_count = (slot.occupancy_count or 0) + 1
+                        elif slot.status == "occupied" and pending_state == "available":
+                            if slot.last_status_change_at:
+                                duration = (now_utc - slot.last_status_change_at.replace(tzinfo=timezone.utc)).total_seconds()
+                                slot.total_occupied_time = (slot.total_occupied_time or 0.0) + duration
+                        
                         slot.status = pending_state
                         slot.last_status_change_at = now_utc
                         if pending_state == "occupied":
@@ -282,9 +303,10 @@ class ProcessingAgent(threading.Thread):
             return
 
         while self.running:
-            cap = cv2.VideoCapture(job.video_path)
-            if cap.isOpened():
-                break
+            with stream_reconnect_lock:
+                cap = cv2.VideoCapture(job.video_path)
+                if cap.isOpened():
+                    break
             
             logging.warning(f"Failed to open stream/file {job.video_path}. Retrying in 5 seconds...")
             await asyncio.sleep(5)
@@ -379,6 +401,12 @@ class ProcessingAgent(threading.Thread):
                 
             self.inference_time_ms = int((time.time() - inference_start) * 1000)
             
+            # Detection FPS calculation (excluding hashing time)
+            actual_inference_time = time.time() - inference_start
+            if actual_inference_time > 0:
+                detection_fps_window.append(1.0 / actual_inference_time)
+            self.latest_detection_fps = statistics.mean(detection_fps_window) if detection_fps_window else 0
+
             # 2. Evaluation
             eval_start = time.time()
             vid_timestamp = current_vid_index / base_fps
@@ -504,6 +532,7 @@ class JobManager:
                 "frame_processing_time_avg": agent.latency_avg if hasattr(agent, "latency_avg") else 0,
                 "frame_processing_time_max": agent.latency_max if hasattr(agent, "latency_max") else 0,
                 "fps": agent.latest_fps if hasattr(agent, "latest_fps") else 0,
+                "detection_fps": agent.latest_detection_fps if hasattr(agent, "latest_detection_fps") else 0,
                 "queue_pressure": agent.queue_pressure if hasattr(agent, "queue_pressure") else 0,
                 "frame_stats": {
                     "frames_received": agent.frames_received,
