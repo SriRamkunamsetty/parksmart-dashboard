@@ -11,3 +11,18 @@ MAX_WORKERS = 1
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", 0.4))
 MAX_VIDEO_SIZE_MB = 500
 DEBUG_PIPELINE = os.getenv("DEBUG_PIPELINE", "True").lower() == "true"
+
+# Stabilization & Performance
+QUEUE_LIMIT = 50
+PROCESSING_FPS_WINDOW = 10
+MIN_POLYGON_AREA = 500
+FRAME_HASH_SIZE = (64, 64)
+FRAME_TIMEOUT_SEC = 2
+STREAM_DISCONNECT_TIMEOUT_SEC = 10
+
+# Stream Sources
+PRIMARY_STREAM_URL = os.getenv("PRIMARY_STREAM_URL", "")
+FALLBACK_STREAM_URL = os.getenv("FALLBACK_STREAM_URL", "")
+
+ALLOWED_VEHICLE_CLASSES = ["car", "truck", "bus", "motorcycle"]
+YOLO_VEHICLE_CLASS_IDS = [2, 3, 5, 7] # COCO: car, motorcycle, bus, truck

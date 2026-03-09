@@ -55,7 +55,9 @@ def system_health():
         "active_workers": len(job_manager.active_jobs),
         "process_uptime": uptime,
         "active_job_id": active_job,
-        "frame_queue_size": len(job_manager.active_jobs) * 50, # In a pure queue system this is the length
+        "frame_queue_pressure": metrics["queue_pressure"],
+        "frame_processing_time_avg": metrics["frame_processing_time_avg"],
+        "frame_processing_time_max": metrics["frame_processing_time_max"],
         "frame_skip_interval": job_manager.get_active_skip_interval(),
         "decode_time_ms": metrics["decode_time_ms"],
         "inference_time_ms": metrics["inference_time_ms"],

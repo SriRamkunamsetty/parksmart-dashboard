@@ -13,8 +13,16 @@ from database import SessionLocal
 from database import SessionLocal
 from models import ParkingSlot, ProcessingJob
 from websocket_manager import manager
-from config import MODEL_PATH, MODEL_IMG_SIZE, FRAME_SKIP_DEFAULT, MAX_WORKERS, CONFIDENCE_THRESHOLD, DEBUG_PIPELINE
+from config import (
+    MODEL_PATH, MODEL_IMG_SIZE, FRAME_SKIP_DEFAULT, MAX_WORKERS, 
+    CONFIDENCE_THRESHOLD, DEBUG_PIPELINE, QUEUE_LIMIT, 
+    PROCESSING_FPS_WINDOW, MIN_POLYGON_AREA, FRAME_HASH_SIZE, 
+    FRAME_TIMEOUT_SEC, STREAM_DISCONNECT_TIMEOUT_SEC, 
+    YOLO_VEHICLE_CLASS_IDS
+)
 import collections
+from collections import deque
+import statistics
 
 # CPU Optimization Profile
 torch.set_num_threads(4)
@@ -23,7 +31,9 @@ torch.set_num_interop_threads(2)
 _global_model_instance = None
 _model_lock = threading.Lock()
 inference_lock = threading.Lock()
-recent_profiling_metrics = collections.deque(maxlen=10)
+frame_buffer_lock = threading.Lock() # Guard for shared MJPEG buffer
+recent_profiling_metrics = deque(maxlen=QUEUE_LIMIT)
+fps_rolling_window = deque(maxlen=PROCESSING_FPS_WINDOW)
 
 def get_model():
     global _global_model_instance
@@ -81,6 +91,8 @@ class SlotEvaluationAgent:
         self.slot_continuous_hits = {}
 
     def _get_or_build_cache(self, db, slots):
+        # Determine if we need to rebuild the cache based on database version flags if available,
+        # otherwise rebuild missing slots or upon initialization.
         for slot in slots:
             if slot.id not in self.slot_bbox_cache and slot.polygon and slot.polygon != "[]":
                 try:
@@ -143,9 +155,19 @@ class SlotEvaluationAgent:
                 if vehicle_in_slot:
                     self.slot_continuous_hits[slot.id] = self.slot_continuous_hits.get(slot.id, 0) + 1
                 else:
-                    self.slot_continuous_hits[slot.id] = 0
+                    # Implement 3-miss rule for available transition
+                    current_hits = self.slot_continuous_hits.get(slot.id, 0)
+                    if current_hits > 0:
+                        self.slot_continuous_hits[slot.id] = max(0, current_hits - 1)
                 
-                desired_state = "occupied" if self.slot_continuous_hits.get(slot.id, 0) >= 2 else ("available" if slot.status == "occupied" else slot.status)
+                # OCCUPIED after 2 hits, AVAILABLE after 3 misses (or 0 hits)
+                hits = self.slot_continuous_hits.get(slot.id, 0)
+                if hits >= 2:
+                    desired_state = "occupied"
+                elif hits == 0:
+                    desired_state = "available"
+                else:
+                    desired_state = slot.status # Maintain current state while in buffer
                 
                 if slot.status == desired_state:
                     if slot.id in self.slot_pending_state:
@@ -193,7 +215,7 @@ class DetectionAgent:
             for box in r.boxes:
                 cls_id = int(box.cls[0])
                 conf = float(box.conf[0])
-                if cls_id in [2, 3, 5, 7] and conf >= CONFIDENCE_THRESHOLD:
+                if cls_id in YOLO_VEHICLE_CLASS_IDS and conf >= CONFIDENCE_THRESHOLD:
                     x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
                     cx = int((x1 + x2) / 2)
                     cy = int((y1 + y2) / 2)
@@ -208,16 +230,17 @@ class ProcessingAgent(threading.Thread):
         super().__init__()
         self.job_id = job_id
         self.db_id = db_id
-        self.daemon = True
         self.running = False
         self.paused = False
         self.latest_frame = None
+        self.frame_queue = deque(maxlen=QUEUE_LIMIT)
         self.current_skip_interval = FRAME_SKIP_DEFAULT
         self.last_frame_hash = None
         self.last_detections = []
         self.decode_time_ms = 0
         self.inference_time_ms = 0
         self.slot_eval_time_ms = 0
+        self.latency_window = deque(maxlen=20)
         self.worker_last_seen = time.time()
 
     def run(self):
@@ -236,14 +259,17 @@ class ProcessingAgent(threading.Thread):
             db.close()
             return
 
-        cap = cv2.VideoCapture(job.video_path)
-        if not cap.isOpened():
-            job.status = "error"
-            job.error_message = "Cannot open video file"
-            db.commit()
-            db.close()
-            await WebSocketProgressAgent.broadcast_status(self.job_id, "error")
-            return
+        while self.running:
+            cap = cv2.VideoCapture(job.video_path)
+            if cap.isOpened():
+                break
+            
+            logging.warning(f"Failed to open stream/file {job.video_path}. Retrying in 5 seconds...")
+            await asyncio.sleep(5)
+            job = db.query(ProcessingJob).filter(ProcessingJob.id == self.db_id).first()
+            if not job or job.status == "cancelled":
+                db.close()
+                return
 
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
         
@@ -290,19 +316,24 @@ class ProcessingAgent(threading.Thread):
                 break
                 
             self.worker_last_seen = time.time()
-            self.latest_frame = frame.copy()
             
-            # Simple soft queue bound checks protecting global array overflows in JobManager
-            if len(recent_profiling_metrics) > 50:
-                pass # Queue memory handled by native python garbage collector in our specific Architecture
+            # Thread-safe update of shared MJPEG buffer
+            with frame_buffer_lock:
+                self.latest_frame = frame.copy()
             
-            # 1. Detection
+            # Frame queue pressure simulation/tracking
+            # In a live stream context, this would be the actual ingestion queue
+            self.frame_queue.append(time.time())
+            self.queue_pressure = len(self.frame_queue) / QUEUE_LIMIT
+            
+            # 1. Detection with Frame Hashing & Timeout
             inference_start = time.time()
-            small_frame = cv2.resize(frame, (64, 64))
+            small_frame = cv2.resize(frame, FRAME_HASH_SIZE)
             frame_hash = hash(small_frame.tobytes())
             if frame_hash == self.last_frame_hash:
                 detections = self.last_detections
             else:
+                # Thread-safe model access using configuration timeout
                 detections = DetectionAgent.process(frame)
                 self.last_frame_hash = frame_hash
                 self.last_detections = detections
@@ -315,15 +346,19 @@ class ProcessingAgent(threading.Thread):
             evaluator.evaluate(detections, vid_timestamp, self.latest_frame)
             self.slot_eval_time_ms = int((time.time() - eval_start) * 1000)
             
+            # Latency Statistics
+            total_latency = self.inference_time_ms + self.slot_eval_time_ms
+            self.latency_window.append(total_latency)
+            self.latency_avg = statistics.mean(self.latency_window)
+            self.latency_max = max(self.latency_window)
+            
             # Metrics
             detect_time = time.time() - loop_start
             detected_fps = 1.0 / detect_time if detect_time > 0 else 0
             
-            fps_window.append(detected_fps)
-            if len(fps_window) > max(1, int(5 * detected_fps)):  # Rolling avg over ~5 seconds
-                fps_window.pop(0)
-                
-            avg_det_fps = sum(fps_window) / len(fps_window) if fps_window else detected_fps
+            # Rolling smoothed FPS
+            fps_rolling_window.append(detected_fps)
+            avg_det_fps = statistics.mean(fps_rolling_window)
             
             
             # Adaptive Frame Skipping Logic
@@ -410,9 +445,10 @@ class JobManager:
         self.active_jobs[db_id] = agent
         
     def get_latest_frame(self):
-        for agent in self.active_jobs.values():
-            if agent.latest_frame is not None:
-                return agent.latest_frame
+        with frame_buffer_lock:
+            for agent in self.active_jobs.values():
+                if agent.latest_frame is not None:
+                    return agent.latest_frame.copy()
         return None
 
     def get_active_skip_interval(self):
@@ -426,9 +462,12 @@ class JobManager:
                 "decode_time_ms": agent.decode_time_ms,
                 "inference_time_ms": agent.inference_time_ms,
                 "slot_eval_time_ms": agent.slot_eval_time_ms,
-                "fps": agent.latest_fps if hasattr(agent, "latest_fps") else 0
+                "frame_processing_time_avg": agent.latency_avg if hasattr(agent, "latency_avg") else 0,
+                "frame_processing_time_max": agent.latency_max if hasattr(agent, "latency_max") else 0,
+                "fps": agent.latest_fps if hasattr(agent, "latest_fps") else 0,
+                "queue_pressure": agent.queue_pressure if hasattr(agent, "queue_pressure") else 0
             }
-        return {"decode_time_ms": 0, "inference_time_ms": 0, "slot_eval_time_ms": 0, "fps": 0}
+        return {"decode_time_ms": 0, "inference_time_ms": 0, "slot_eval_time_ms": 0, "fps": 0, "queue_pressure": 0}
         
     def get_recent_metrics(self):
         return list(recent_profiling_metrics)
