@@ -20,7 +20,7 @@ from config import (
     FRAME_TIMEOUT_SEC, STREAM_DISCONNECT_TIMEOUT_SEC, 
     YOLO_VEHICLE_CLASS_IDS, QUEUE_BACKPRESSURE_THRESHOLD,
     SLOT_STATE_COOLDOWN_SEC, DEBUG_STREAM_ENABLED, MAX_STREAM_RETRIES,
-    TRACK_LOST_TIMEOUT, EVENT_LOG_RETENTION_HOURS, TRACKER_MAP_DISTANCE_THRESHOLD,
+    TRACK_LOST_TIMEOUT, EVENT_LOG_RETENTION_HOURS, MIN_TRACKER_REID_DISTANCE,
     TRACKER_MAP_TTL
 )
 import collections
@@ -33,6 +33,8 @@ torch.set_num_interop_threads(2)
 
 _global_model_instance = None
 _model_lock = threading.Lock()
+_model_load_time = None
+_model_device = "cpu"
 inference_lock = threading.Lock()
 frame_buffer_lock = threading.Lock() # Guard for shared MJPEG buffer
 slot_cache_lock = threading.Lock()   # Guard for geometry and bbox caches
@@ -66,15 +68,26 @@ def set_system_mode(mode: str):
         db.close()
 
 def get_model():
-    global _global_model_instance
+    global _global_model_instance, _model_load_time, _model_device
     if _global_model_instance is None:
         with _model_lock:
             if _global_model_instance is None:
                 try:
-                    _global_model_instance = YOLO(MODEL_PATH).to("cpu")
+                    _global_model_instance = YOLO(MODEL_PATH)
+                    _model_device = "cuda" if torch.cuda.is_available() else "cpu"
+                    _global_model_instance.to(_model_device)
+                    _model_load_time = datetime.now(timezone.utc).isoformat()
                 except Exception as e:
                     logging.error(f"Failed to load YOLO model: {e}")
     return _global_model_instance
+
+def get_model_metadata():
+    return {
+        "model_name": os.path.basename(MODEL_PATH),
+        "model_device": _model_device,
+        "model_load_time": _model_load_time,
+        "model_version": "8.0"
+    }
 
 def get_iso_time():
     return datetime.now(timezone.utc).isoformat()
@@ -173,10 +186,9 @@ class SlotEvaluationAgent:
             now_ts = time.time()
             
             # --- Memory Cleanup: Remove old tracker mappings ---
-            expired_vid = [vid for vid, (lcx, lcy, lts) in self.last_known_centroids.items() if now_ts - lts > TRACKER_MAP_TTL]
+            expired_vid = [vid for vid, data in self.last_known_centroids.items() if now_ts - data[2] > TRACKER_MAP_TTL]
             for vid in expired_vid:
                 del self.last_known_centroids[vid]
-                # Also remove from tracker_vehicle_map
                 tids_to_del = [tid for tid, v_id in self.tracker_vehicle_map.items() if v_id == vid]
                 for tid in tids_to_del:
                     del self.tracker_vehicle_map[tid]
@@ -185,30 +197,15 @@ class SlotEvaluationAgent:
             for d in detections:
                 tid = d.get("track_id")
                 if tid is not None:
-                    cx, cy = d["centroid"]
-                    if tid not in self.tracker_vehicle_map:
-                        # Try to find a nearby previous vehicle
-                        best_vid = None
-                        min_dist = TRACKER_MAP_DISTANCE_THRESHOLD
-                        
-                        for vid, (lcx, lcy, lts) in list(self.last_known_centroids.items()):
-                            if now_ts - lts < 10.0: # Only look back 10s
-                                dist = np.sqrt((cx - lcx)**2 + (cy - lcy)**2)
-                                if dist < min_dist:
-                                    min_dist = dist
-                                    best_vid = vid
-                        
-                        if best_vid:
-                            logging.info(f"[Identity] Re-mapped tracker {tid} to existing vehicle {best_vid}")
-                            self.tracker_vehicle_map[tid] = best_vid
-                        else:
-                            # Use new track id as vehicle id
-                            self.tracker_vehicle_map[tid] = str(tid)
-                    
-                    vid = self.tracker_vehicle_map[tid]
-                    self.last_known_centroids[vid] = (cx, cy, now_ts)
-                    # For session logging, we'll use this mapped vid
-                    d["vehicle_id"] = vid
+                    if tid in self.tracker_vehicle_map:
+                        vid = self.tracker_vehicle_map[tid]
+                        # Update timestamp but keep old slot info for now if already mapped
+                        prev_data = self.last_known_centroids.get(vid)
+                        if prev_data:
+                            lcx, lcy, lts, lsid = prev_data
+                            cx, cy = d["centroid"]
+                            self.last_known_centroids[vid] = (cx, cy, now_ts, lsid)
+                        d["vehicle_id"] = vid
             
             with slot_cache_lock:
                 target_slots_data = [(s, self.slot_bbox_cache[s.id]) for s in slots if s.id in self.slot_bbox_cache]
@@ -247,7 +244,32 @@ class SlotEvaluationAgent:
                         if DEBUG_PIPELINE:
                             logging.debug(f"[SlotEval] Centroid ({cx},{cy}) inside polygon for slot {slot.id} (S{slot.number}) -> OCCUPIED")
                         vehicle_in_slot = True
-                        found_track_id = v.get("track_id")
+                        tid = v.get("track_id")
+                        if tid is not None:
+                            # Correction 1 — Tracker Re-Identification Safeguard
+                            if tid not in self.tracker_vehicle_map:
+                                best_vid = None
+                                min_dist = MIN_TRACKER_REID_DISTANCE
+                                for vid, data in self.last_known_centroids.items():
+                                    lcx, lcy, lts, lsid = data
+                                    if lsid == slot.id:
+                                        dist = np.sqrt((cx - lcx)**2 + (cy - lcy)**2)
+                                        if dist < min_dist:
+                                            min_dist = dist
+                                            best_vid = vid
+                                
+                                if best_vid:
+                                    logging.info(f"[Identity] Re-mapped tracker {tid} to vehicle {best_vid} in slot {slot.id}")
+                                    self.tracker_vehicle_map[tid] = best_vid
+                                else:
+                                    self.tracker_vehicle_map[tid] = str(tid)
+                            
+                            vid = self.tracker_vehicle_map[tid]
+                            self.last_known_centroids[vid] = (cx, cy, now_ts, slot.id)
+                            v["vehicle_id"] = vid
+                            found_track_id = vid
+                        else:
+                            found_track_id = "unknown"
                         break
                 
                 if DEBUG_PIPELINE and DEBUG_STREAM_ENABLED and poly is not None and len(poly) > 0 and eval_frame is not None:

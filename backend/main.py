@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from database import engine, SessionLocal
 import models
 from models import ProcessingJob, ParkingSession, SystemEvent, ParkingSlot
-from config import MODEL_IMG_SIZE, EVENT_LOG_RETENTION_HOURS, LIVE_API_CACHE_TTL
+from config import MODEL_IMG_SIZE, EVENT_LOG_RETENTION_HOURS, LIVE_API_CACHE_TTL, MIN_FORECAST_SAMPLE_SIZE, FORECAST_CACHE_TTL
 
 logging.basicConfig(
     level=logging.INFO, 
@@ -21,13 +21,14 @@ logging.basicConfig(
 from routes import slots, booking, admin, upload_video
 from booking_timer import scheduler
 from websocket_manager import manager
-from worker import job_manager, get_model, get_system_settings, set_system_mode
+from worker import job_manager, get_model, get_system_settings, set_system_mode, get_model_metadata
 
 models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Parksmart API")
 START_TIME = datetime.utcnow()
 LIVE_SLOTS_CACHE = {"data": None, "timestamp": 0}
+FORECAST_CACHE = {"data": None, "timestamp": 0}
 
 app.add_middleware(
     CORSMiddleware,
@@ -139,11 +140,17 @@ def get_slots_live():
                 if active_session:
                     vehicle_id = active_session.vehicle_id
                     session_duration = (now_utc - active_session.entry_time).total_seconds()
+            # Improvement 1 — Add Slot Visualization Metadata
+            uptime = (datetime.utcnow() - START_TIME).total_seconds()
+            rate = min(1.0, s.total_occupied_time / uptime) if uptime > 0 else 0
+            
             result.append({
                 "slot_id": s.id,
                 "status": s.status,
                 "vehicle_id": vehicle_id,
-                "session_duration_sec": round(session_duration, 2)
+                "session_duration_sec": round(session_duration, 2),
+                "occupancy_rate": round(rate, 2),
+                "last_updated": s.last_status_change_at.isoformat() if s.last_status_change_at else None
             })
         LIVE_SLOTS_CACHE = {"data": result, "timestamp": now_ts}
         return result
@@ -176,32 +183,52 @@ def get_vehicle_analytics():
 
 @app.get("/api/analytics/occupancy-forecast")
 def get_occupancy_forecast():
-    """Simple rolling average forecast based on historical sessions"""
+    """Simple rolling average forecast with safety guard and caching"""
+    global FORECAST_CACHE
+    import time
+    now_ts = time.time()
+    
+    if FORECAST_CACHE["data"] and (now_ts - FORECAST_CACHE["timestamp"] < FORECAST_CACHE_TTL):
+        return FORECAST_CACHE["data"]
+        
     db = SessionLocal()
     try:
-        # Get count of occupied slots over the last 24 hours
-        # For a simple forecast, we just check current average occupancy
-        # In a real app, this would be a time-series model.
+        # Correction 2 — Forecast Model Protection
+        total_sessions = db.query(ParkingSession).count()
+        if total_sessions < MIN_FORECAST_SAMPLE_SIZE:
+            return {
+                "predicted_occupancy": None,
+                "status": "insufficient_data",
+                "sample_size": total_sessions,
+                "required": MIN_FORECAST_SAMPLE_SIZE
+            }
+
         slots = db.query(ParkingSlot).all()
         current_occupied = sum(1 for s in slots if s.status == "occupied")
         
-        # Simple Logic: Current occupancy + random variance for 'forecast'
-        # Or look at last 3 hours of sessions
         three_hours_ago = datetime.utcnow() - timedelta(hours=3)
         recent_sessions = db.query(ParkingSession).filter(
             (ParkingSession.entry_time >= three_hours_ago) | (ParkingSession.exit_time == None)
         ).count()
         
-        # Forecast = avg number of slots occupied recently
         forecast_val = round((recent_sessions + current_occupied) / 2, 1)
         
-        return {
+        res = {
             "predicted_occupancy": min(len(slots), forecast_val),
             "confidence": 0.75,
-            "period": "next_1_hour"
+            "period": "next_1_hour",
+            "status": "success",
+            "sample_size": total_sessions
         }
+        FORECAST_CACHE = {"data": res, "timestamp": now_ts}
+        return res
     finally:
         db.close()
+
+@app.get("/api/system/model")
+def get_model_info():
+    """Improvement 2 — Add Model Metadata Endpoint"""
+    return get_model_metadata()
 
 @app.get("/api/events")
 def get_events(limit: int = 50):
