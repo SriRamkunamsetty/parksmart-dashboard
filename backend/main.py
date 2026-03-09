@@ -21,7 +21,7 @@ logging.basicConfig(
 from routes import slots, booking, admin, upload_video
 from booking_timer import scheduler
 from websocket_manager import manager
-from worker import job_manager, get_model
+from worker import job_manager, get_model, get_system_settings, set_system_mode
 
 models.Base.metadata.create_all(bind=engine)
 
@@ -66,8 +66,22 @@ def system_health():
         "decode_time_ms": metrics["decode_time_ms"],
         "inference_time_ms": metrics["inference_time_ms"],
         "slot_eval_time_ms": metrics["slot_eval_time_ms"],
-        "recent_metrics": job_manager.get_recent_metrics()
     }
+
+@app.get("/api/system/settings")
+def get_settings():
+    settings = get_system_settings()
+    return {
+        "system_status": getattr(settings, "system_status", "idle"),
+        "system_mode": getattr(settings, "system_mode", "NORMAL")
+    }
+
+@app.post("/api/system/mode")
+def update_system_mode(mode: str):
+    if mode not in ["NORMAL", "SAFE_MODE"]:
+        return {"error": "Invalid mode"}
+    set_system_mode(mode)
+    return {"status": "success", "mode": mode}
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -92,6 +106,49 @@ def get_slots_utilization():
                 "heatmap_count": s.heatmap_count or 0
             }
             for s in slots
+        ]
+    finally:
+        db.close()
+
+@app.get("/api/slots/heatmap")
+def get_slots_heatmap():
+    db = SessionLocal()
+    try:
+        slots = db.query(models.ParkingSlot).all()
+        result = []
+        for s in slots:
+            uptime = (datetime.utcnow() - START_TIME).total_seconds()
+            rate = min(1.0, s.total_occupied_time / uptime) if uptime > 0 else 0
+            avg_duration = s.total_occupied_time / s.occupancy_count if (s.occupancy_count and s.occupancy_count > 0) else 0
+            result.append({
+                "slot_id": s.id,
+                "occupancy_rate": round(rate, 2),
+                "average_duration_sec": round(avg_duration, 2)
+            })
+        return result
+    finally:
+        db.close()
+
+@app.get("/api/analytics/vehicle-types")
+def get_vehicle_analytics():
+    metrics = job_manager.get_profiling_metrics()
+    return metrics["detected_classes"]
+
+@app.get("/api/events")
+def get_events(limit: int = 50):
+    db = SessionLocal()
+    try:
+        import json
+        events = db.query(models.SystemEvent).order_by(models.SystemEvent.timestamp.desc()).limit(limit).all()
+        return [
+            {
+                "id": e.id,
+                "event_type": e.event_type,
+                "message": e.message,
+                "timestamp": e.timestamp.isoformat(),
+                "meta_data": json.loads(e.meta_data) if e.meta_data else {}
+            }
+            for e in events
         ]
     finally:
         db.close()

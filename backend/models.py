@@ -45,6 +45,16 @@ class SystemState(Base):
     
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     system_status = Column(String(50), default="idle")
+    system_mode = Column(String(50), default="NORMAL") # NORMAL | SAFE_MODE
+
+class SystemEvent(Base):
+    __tablename__ = "system_events"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    event_type = Column(String(100))
+    message = Column(String(500))
+    timestamp = Column(DateTime, default=datetime.datetime.utcnow)
+    meta_data = Column(String(1000), nullable=True) # JSON string for extra context
 
 class ProcessingJob(Base):
     __tablename__ = "processing_jobs"

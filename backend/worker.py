@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 
 from database import SessionLocal
 from database import SessionLocal
-from models import ParkingSlot, ProcessingJob, ParkingSession
+from models import ParkingSlot, ProcessingJob, ParkingSession, SystemState, SystemEvent
 from websocket_manager import manager
 from config import (
     MODEL_PATH, MODEL_IMG_SIZE, FRAME_SKIP_DEFAULT, MAX_WORKERS, 
@@ -19,7 +19,8 @@ from config import (
     PROCESSING_FPS_WINDOW, MIN_POLYGON_AREA, FRAME_HASH_SIZE, 
     FRAME_TIMEOUT_SEC, STREAM_DISCONNECT_TIMEOUT_SEC, 
     YOLO_VEHICLE_CLASS_IDS, QUEUE_BACKPRESSURE_THRESHOLD,
-    SLOT_STATE_COOLDOWN_SEC, DEBUG_STREAM_ENABLED, MAX_STREAM_RETRIES
+    SLOT_STATE_COOLDOWN_SEC, DEBUG_STREAM_ENABLED, MAX_STREAM_RETRIES,
+    TRACK_LOST_TIMEOUT
 )
 import collections
 from collections import deque
@@ -39,7 +40,29 @@ stream_reconnect_lock = threading.Lock() # Ensure single reconnection thread
 recent_profiling_metrics = deque(maxlen=QUEUE_LIMIT)
 fps_rolling_window = deque(maxlen=PROCESSING_FPS_WINDOW)
 detection_fps_window = deque(maxlen=PROCESSING_FPS_WINDOW)
-system_mode = "NORMAL" # NORMAL | SAFE_MODE
+def get_system_settings():
+    db = SessionLocal()
+    try:
+        state = db.query(SystemState).first()
+        if not state:
+            state = SystemState(system_status="idle", system_mode="NORMAL")
+            db.add(state)
+            db.commit()
+            db.refresh(state)
+        return state
+    finally:
+        db.close()
+
+def set_system_mode(mode: str):
+    db = SessionLocal()
+    try:
+        state = db.query(SystemState).first()
+        if state:
+            state.system_mode = mode
+            db.commit()
+            log_event("system_mode_change", f"System mode changed to {mode}", {"mode": mode})
+    finally:
+        db.close()
 
 def get_model():
     global _global_model_instance
@@ -54,6 +77,21 @@ def get_model():
 
 def get_iso_time():
     return datetime.now(timezone.utc).isoformat()
+
+def log_event(event_type: str, message: str, meta_data: dict = None):
+    db = SessionLocal()
+    try:
+        event = SystemEvent(
+            event_type=event_type,
+            message=message,
+            meta_data=json.dumps(meta_data) if meta_data else None
+        )
+        db.add(event)
+        db.commit()
+    except Exception as e:
+        logging.error(f"Failed to log event {event_type}: {e}")
+    finally:
+        db.close()
 
 class WebSocketProgressAgent:
     @staticmethod
@@ -96,6 +134,7 @@ class SlotEvaluationAgent:
         self.slot_bbox_cache = {}    
         self.slot_continuous_hits = {}
         self.cached_polygon_version = {} # slot_id -> version
+        self.last_seen_tracks = {} # tracker_id -> timestamp
 
     def _get_or_build_cache(self, db, slots):
         for slot in slots:
@@ -213,15 +252,28 @@ class SlotEvaluationAgent:
                         
                         # Utilization Analytics & Session Logging
                         if pending_state == "occupied" and slot.status != "occupied":
-                            slot.occupancy_count = (slot.occupancy_count or 0) + 1
-                            slot.occupied_start_time = now_utc
-                            # Start Session
-                            session = ParkingSession(
-                                slot_id=slot.id,
-                                vehicle_id=str(found_track_id or "unknown"),
-                                entry_time=now_utc
-                            )
-                            db.add(session)
+                            # Correction 2 — Prevent Session Duplication
+                            # Only open a new session if one isn't already active for this slot
+                            existing_session = db.query(ParkingSession).filter(
+                                ParkingSession.slot_id == slot.id,
+                                ParkingSession.exit_time == None
+                            ).first()
+                            
+                            if not existing_session:
+                                slot.occupancy_count = (slot.occupancy_count or 0) + 1
+                                slot.occupied_start_time = now_utc
+                                # Start Session
+                                session = ParkingSession(
+                                    slot_id=slot.id,
+                                    vehicle_id=str(found_track_id or "unknown"),
+                                    entry_time=now_utc
+                                )
+                                db.add(session)
+                                log_event("vehicle_entered_slot", f"Vehicle entered slot {slot.id}", {"slot_id": slot.id, "track_id": found_track_id})
+                            else:
+                                if DEBUG_PIPELINE:
+                                    logging.debug(f"[SlotEval] Session already active for slot {slot.id}, skipping duplicate creation.")
+                                
                         elif slot.status == "occupied" and pending_state == "available":
                             if slot.last_status_change_at:
                                 duration = (now_utc - slot.last_status_change_at.replace(tzinfo=timezone.utc)).total_seconds()
@@ -235,6 +287,7 @@ class SlotEvaluationAgent:
                                 latest_session.exit_time = now_utc
                                 latest_session.duration = (now_utc - latest_session.entry_time).total_seconds()
                             slot.occupied_start_time = None
+                            log_event("vehicle_left_slot", f"Vehicle left slot {slot.id}", {"slot_id": slot.id})
                         
                         slot.status = pending_state
                         slot.last_status_change_at = now_utc
@@ -250,6 +303,60 @@ class SlotEvaluationAgent:
                             "timestamp": get_iso_time()
                         })
                         
+                        log_event("slot_status_change", f"Slot {slot.id} changed to {pending_state}", {"slot_id": slot.id, "status": pending_state})
+
+            # Correction 1: Handle Tracker ID Reset / Lost Timeout
+            for slot in target_slots_data:
+                slot_obj = slot[0]
+                if slot_obj.status == "occupied" and slot_obj.occupied_start_time:
+                    # Check if tracker associated with this slot is still alive
+                    # This is slightly complex as we don't strictly associate 1 track to 1 slot in the model
+                    # But we can check if ANY track is currently in the slot. 
+                    # If NO track is in the slot for > TRACK_LOST_TIMEOUT, force available.
+                    
+                    found_any_track = False
+                    for v in detections:
+                        cx, cy = v["centroid"]
+                        # Re-run point test for current frame detections
+                        # (Optimization: could cache this if we haven't already moved to next task)
+                        with slot_cache_lock:
+                            _, _, _, _, _, poly = self.slot_bbox_cache[slot_obj.id]
+                        if cv2.pointPolygonTest(poly, (float(cx), float(cy)), False) >= 0:
+                            found_any_track = True
+                            break
+                    
+                    if not found_any_track:
+                        # If not found in current detections, check when we last saw occupancy here
+                        # We use last_status_change_at as a proxy for 'last confirmed presence'
+                        last_confirmed = slot_obj.last_status_change_at.replace(tzinfo=timezone.utc)
+                        if (datetime.now(timezone.utc) - last_confirmed).total_seconds() > TRACK_LOST_TIMEOUT:
+                            logging.info(f"Tracker timeout for slot {slot_obj.id}. Resetting to available.")
+                            
+                            # Close session
+                            latest_session = db.query(ParkingSession).filter(
+                                ParkingSession.slot_id == slot_obj.id,
+                                ParkingSession.exit_time == None
+                            ).order_by(ParkingSession.entry_time.desc()).first()
+                            
+                            now_utc = datetime.now(timezone.utc)
+                            if latest_session:
+                                latest_session.exit_time = now_utc
+                                latest_session.duration = (now_utc - latest_session.entry_time).total_seconds()
+                            
+                            slot_obj.status = "available"
+                            slot_obj.last_status_change_at = now_utc
+                            slot_obj.occupied_start_time = None
+                            db.commit()
+                            
+                            log_event("vehicle_left_slot", f"Vehicle left slot {slot_obj.id} (Tracker Timeout)", {"slot_id": slot_obj.id})
+                            
+                            manager.sync_broadcast({
+                                "event": "slot_update",
+                                "slot_id": slot_obj.id,
+                                "status": "available",
+                                "timestamp": get_iso_time()
+                            })
+
         except Exception as e:
             logging.error(f"Slot evaluation error: {e}")
             db.rollback()
@@ -350,9 +457,10 @@ class ProcessingAgent(threading.Thread):
             
             self.stream_retry_count += 1
             if self.stream_retry_count > MAX_STREAM_RETRIES:
-                global system_mode
-                system_mode = "SAFE_MODE"
+                set_system_mode("SAFE_MODE")
                 logging.error(f"Stream reconnection failed after {MAX_STREAM_RETRIES} attempts. SYSTEM_MODE -> SAFE_MODE")
+            
+            log_event("stream_reconnect_retry", f"Reconnection attempt {self.stream_retry_count} for {job.video_path}", {"job_id": self.job_id, "attempt": self.stream_retry_count})
             
             logging.warning(f"Failed to open stream/file {job.video_path} (Attempt {self.stream_retry_count}). Retrying in 5 seconds...")
             await asyncio.sleep(5)
@@ -552,6 +660,7 @@ class JobManager:
                     dead_workers.append((db_id, getattr(agent, 'job_id', 'unknown')))
                     
             for db_id, j_id in dead_workers:
+                log_event("worker_restart", f"Watchdog restarting worker {j_id}", {"job_id": j_id, "db_id": db_id})
                 self.cancel_job(db_id)
                 self.resume_job(db_id)
         
