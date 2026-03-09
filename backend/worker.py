@@ -18,7 +18,8 @@ from config import (
     CONFIDENCE_THRESHOLD, DEBUG_PIPELINE, QUEUE_LIMIT, 
     PROCESSING_FPS_WINDOW, MIN_POLYGON_AREA, FRAME_HASH_SIZE, 
     FRAME_TIMEOUT_SEC, STREAM_DISCONNECT_TIMEOUT_SEC, 
-    YOLO_VEHICLE_CLASS_IDS
+    YOLO_VEHICLE_CLASS_IDS, QUEUE_BACKPRESSURE_THRESHOLD,
+    SLOT_STATE_COOLDOWN_SEC
 )
 import collections
 from collections import deque
@@ -89,12 +90,15 @@ class SlotEvaluationAgent:
         self.slot_pending_state = {} 
         self.slot_bbox_cache = {}    
         self.slot_continuous_hits = {}
+        self.cached_polygon_version = {} # slot_id -> version
 
     def _get_or_build_cache(self, db, slots):
-        # Determine if we need to rebuild the cache based on database version flags if available,
-        # otherwise rebuild missing slots or upon initialization.
         for slot in slots:
-            if slot.id not in self.slot_bbox_cache and slot.polygon and slot.polygon != "[]":
+            # Rebuild if not in cache OR if version in DB is different from cached version
+            needs_rebuild = slot.id not in self.slot_bbox_cache or \
+                           self.cached_polygon_version.get(slot.id) != slot.polygon_version
+            
+            if needs_rebuild and slot.polygon and slot.polygon != "[]":
                 try:
                     pts = json.loads(slot.polygon)
                     if len(pts) >= 3:
@@ -102,6 +106,7 @@ class SlotEvaluationAgent:
                         x, y, w, h = cv2.boundingRect(poly)
                         area = cv2.contourArea(poly) or 1
                         self.slot_bbox_cache[slot.id] = (x, y, w, h, area, poly)
+                        self.cached_polygon_version[slot.id] = slot.polygon_version
                 except Exception as e:
                     logging.error(f"Polygon parse error for {slot.id}: {e}")
                     
@@ -179,8 +184,19 @@ class SlotEvaluationAgent:
                 else:
                     pending_state, first_seen = self.slot_pending_state[slot.id]
                     if current_timestamp - first_seen >= 1.0:
+                        # Enforce SLOT_STATE_COOLDOWN_SEC
+                        now_utc = datetime.now(timezone.utc)
+                        delta = (now_utc - slot.last_status_change_at.replace(tzinfo=timezone.utc)).total_seconds() \
+                                if slot.last_status_change_at else 999
+                        
+                        if delta < SLOT_STATE_COOLDOWN_SEC:
+                            if DEBUG_PIPELINE:
+                                logging.debug(f"[SlotEval] Rejecting state change for slot {slot.id} (S{slot.number}): Cooldown active ({delta:.2f}s < {SLOT_STATE_COOLDOWN_SEC}s)")
+                            continue
+
                         logging.info(f"Updating slot {slot.id} (S{slot.number}) status: {slot.status} -> {pending_state}")
                         slot.status = pending_state
+                        slot.last_status_change_at = now_utc
                         if pending_state == "occupied":
                             slot.heatmap_count = (slot.heatmap_count or 0) + 1
                         db.commit()
@@ -221,7 +237,8 @@ class DetectionAgent:
                     cy = int((y1 + y2) / 2)
                     detections.append({
                         "bbox": (x1, y1, x2, y2),
-                        "centroid": (cx, cy)
+                        "centroid": (cx, cy),
+                        "class_id": cls_id
                     })
         return detections
 
@@ -242,6 +259,11 @@ class ProcessingAgent(threading.Thread):
         self.slot_eval_time_ms = 0
         self.latency_window = deque(maxlen=20)
         self.worker_last_seen = time.time()
+        self.frames_received = 0
+        self.frames_processed = 0
+        self.frames_dropped = 0
+        self.detected_classes = {"car": 0, "truck": 0, "bus": 0, "motorcycle": 0}
+        self.stream_source = "primary"
 
     def run(self):
         self.running = True
@@ -316,15 +338,26 @@ class ProcessingAgent(threading.Thread):
                 break
                 
             self.worker_last_seen = time.time()
+            self.frames_received += 1
             
+            # Frame queue pressure simulation/tracking
+            self.frame_queue.append(time.time())
+            self.queue_pressure = len(self.frame_queue) / QUEUE_LIMIT
+            
+            # Dropped frames logic (if queue was overflowing, but here we process sequentially)
+            # In a real producer-consumer, we'd pop oldest if queue full.
+            
+            # Adaptive Backpressure: Increase skip interval if pressure > threshold
+            if self.queue_pressure > QUEUE_BACKPRESSURE_THRESHOLD:
+                self.current_skip_interval = min(30, self.current_skip_interval + 2)
+                if DEBUG_PIPELINE:
+                    logging.warning(f"[Backpressure] Pressure high ({self.queue_pressure:.2f}), increasing skip to {self.current_skip_interval}")
+
             # Thread-safe update of shared MJPEG buffer
             with frame_buffer_lock:
                 self.latest_frame = frame.copy()
             
-            # Frame queue pressure simulation/tracking
-            # In a live stream context, this would be the actual ingestion queue
-            self.frame_queue.append(time.time())
-            self.queue_pressure = len(self.frame_queue) / QUEUE_LIMIT
+            self.frames_processed += 1
             
             # 1. Detection with Frame Hashing & Timeout
             inference_start = time.time()
@@ -333,10 +366,16 @@ class ProcessingAgent(threading.Thread):
             if frame_hash == self.last_frame_hash:
                 detections = self.last_detections
             else:
-                # Thread-safe model access using configuration timeout
                 detections = DetectionAgent.process(frame)
                 self.last_frame_hash = frame_hash
                 self.last_detections = detections
+                # Count classes for diagnostics
+                class_map = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
+                for d in detections:
+                    cls_id = d.get("class_id")
+                    if cls_id in class_map:
+                        cls_name = class_map[cls_id]
+                        self.detected_classes[cls_name] += 1
                 
             self.inference_time_ms = int((time.time() - inference_start) * 1000)
             
@@ -465,9 +504,21 @@ class JobManager:
                 "frame_processing_time_avg": agent.latency_avg if hasattr(agent, "latency_avg") else 0,
                 "frame_processing_time_max": agent.latency_max if hasattr(agent, "latency_max") else 0,
                 "fps": agent.latest_fps if hasattr(agent, "latest_fps") else 0,
-                "queue_pressure": agent.queue_pressure if hasattr(agent, "queue_pressure") else 0
+                "queue_pressure": agent.queue_pressure if hasattr(agent, "queue_pressure") else 0,
+                "frame_stats": {
+                    "frames_received": agent.frames_received,
+                    "frames_processed": agent.frames_processed,
+                    "frames_dropped": agent.frames_dropped
+                },
+                "detected_classes": agent.detected_classes,
+                "stream_source": agent.stream_source
             }
-        return {"decode_time_ms": 0, "inference_time_ms": 0, "slot_eval_time_ms": 0, "fps": 0, "queue_pressure": 0}
+        return {
+            "decode_time_ms": 0, "inference_time_ms": 0, "slot_eval_time_ms": 0, "fps": 0, "queue_pressure": 0,
+            "frame_stats": {"frames_received": 0, "frames_processed": 0, "frames_dropped": 0},
+            "detected_classes": {"car": 0, "truck": 0, "bus": 0, "motorcycle": 0},
+            "stream_source": "none"
+        }
         
     def get_recent_metrics(self):
         return list(recent_profiling_metrics)
