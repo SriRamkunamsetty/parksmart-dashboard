@@ -12,6 +12,7 @@ def book_slot(data: dict, db: Session = Depends(get_db)):
     slot = db.query(ParkingSlot).filter(ParkingSlot.id == data.get("slot_id")).first()
     if not slot:
         return {"error": "Slot not found"}
+    # Section 5: Booking Validation - Demo Requirement
     if slot.status != "available":
         return {"error": "Slot not available"}
         

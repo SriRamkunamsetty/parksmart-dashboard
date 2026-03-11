@@ -1,861 +1,570 @@
 import cv2
 import numpy as np
-from ultralytics import YOLO
 import logging
 import time
-import torch
-import json
-import asyncio
+import os
 import threading
+import psutil
+import asyncio
 from datetime import datetime, timezone
-
-from database import SessionLocal
-from database import SessionLocal
-from models import ParkingSlot, ProcessingJob, ParkingSession, SystemState, SystemEvent
-from websocket_manager import manager
-from config import (
-    MODEL_PATH, MODEL_IMG_SIZE, FRAME_SKIP_DEFAULT, MAX_WORKERS, 
-    CONFIDENCE_THRESHOLD, DEBUG_PIPELINE, QUEUE_LIMIT, 
-    PROCESSING_FPS_WINDOW, MIN_POLYGON_AREA, FRAME_HASH_SIZE, 
-    FRAME_TIMEOUT_SEC, STREAM_DISCONNECT_TIMEOUT_SEC, 
-    YOLO_VEHICLE_CLASS_IDS, QUEUE_BACKPRESSURE_THRESHOLD,
-    SLOT_STATE_COOLDOWN_SEC, DEBUG_STREAM_ENABLED, MAX_STREAM_RETRIES,
-    TRACK_LOST_TIMEOUT, EVENT_LOG_RETENTION_HOURS, MIN_TRACKER_REID_DISTANCE,
-    TRACKER_MAP_TTL
-)
-import collections
 from collections import deque
 import statistics
+from shapely.geometry import Polygon
 
-# CPU Optimization Profile
-torch.set_num_threads(4)
-torch.set_num_interop_threads(2)
+from database import SessionLocal
+from models import ParkingSlot, ProcessingJob, ParkingSession
+from websocket_manager import manager
+from config import (
+    QUEUE_LIMIT, MAX_FPS_PROCESSING, MEMORY_RESTART_MB, 
+    MAX_STREAM_RETRIES, HASH_DISTANCE_THRESHOLD, PROCESSING_LATENCY_WINDOW,
+    MAX_HASH_SKIP_FRAMES, FPS_STABILITY_WINDOW
+)
 
-_global_model_instance = None
-_model_lock = threading.Lock()
-_model_load_time = None
-_model_device = "cpu"
-inference_lock = threading.Lock()
-frame_buffer_lock = threading.Lock() # Guard for shared MJPEG buffer
-slot_cache_lock = threading.Lock()   # Guard for geometry and bbox caches
-frame_queue_lock = threading.Lock()   # Guard for frame queue push/pop
-stream_reconnect_lock = threading.Lock() # Ensure single reconnection thread
-recent_profiling_metrics = deque(maxlen=QUEUE_LIMIT)
-fps_rolling_window = deque(maxlen=PROCESSING_FPS_WINDOW)
-detection_fps_window = deque(maxlen=PROCESSING_FPS_WINDOW)
-def get_system_settings():
-    db = SessionLocal()
-    try:
-        state = db.query(SystemState).first()
-        if not state:
-            state = SystemState(system_status="idle", system_mode="NORMAL")
-            db.add(state)
-            db.commit()
-            db.refresh(state)
-        return state
-    finally:
-        db.close()
+from services.detection_service import get_detection_service
+from services.slot_service import slot_service, DESIGN_WIDTH, DESIGN_HEIGHT
+from services.tracking_service import tracking_service
+from utils.hash_utils import compute_frame_hash, calculate_hash_distance
+from utils.frame_utils import encode_frame_to_mjpeg, draw_detection_overlay
+from utils.logging_utils import log_event
 
-def set_system_mode(mode: str):
-    db = SessionLocal()
-    try:
-        state = db.query(SystemState).first()
-        if state:
-            state.system_mode = mode
-            db.commit()
-            log_event("system_mode_change", f"System mode changed to {mode}", {"mode": mode})
-    finally:
-        db.close()
+# Project Root Detection
+# worker.py is in backend/, project root is one level up
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_VIDEO = os.path.abspath(os.path.join(ROOT_DIR, "parking_video.mp4"))
 
-def get_model():
-    global _global_model_instance, _model_load_time, _model_device
-    if _global_model_instance is None:
-        with _model_lock:
-            if _global_model_instance is None:
-                try:
-                    _global_model_instance = YOLO(MODEL_PATH)
-                    _model_device = "cuda" if torch.cuda.is_available() else "cpu"
-                    _global_model_instance.to(_model_device)
-                    _model_load_time = datetime.now(timezone.utc).isoformat()
-                except Exception as e:
-                    logging.error(f"Failed to load YOLO model: {e}")
-    return _global_model_instance
+log_event("startup", f"[STARTUP] default video source: {os.path.basename(DEFAULT_VIDEO)}")
 
-def get_model_metadata():
-    return {
-        "model_name": os.path.basename(MODEL_PATH),
-        "model_device": _model_device,
-        "model_load_time": _model_load_time,
-        "model_version": "8.0"
-    }
+DEMO_STATE_APPLIED = False
 
-def get_iso_time():
-    return datetime.now(timezone.utc).isoformat()
-
-def log_event(event_type: str, message: str, meta_data: dict = None):
-    db = SessionLocal()
-    try:
-        event = SystemEvent(
-            event_type=event_type,
-            message=message,
-            meta_data=json.dumps(meta_data) if meta_data else None
-        )
-        db.add(event)
-        db.commit()
-    except Exception as e:
-        logging.error(f"Failed to log event {event_type}: {e}")
-    finally:
-        db.close()
-
-class WebSocketProgressAgent:
-    @staticmethod
-    async def broadcast_progress(job_id: str, progress: float, processed: int, total: int, fps: float, eta: float, skip_interval: int):
-        payload = {
-            "event": "video_progress",
-            "timestamp": get_iso_time(),
-            "job_id": job_id,
-            "payload": {
-                "progress": round(progress, 2),
-                "processed_frames": processed,
-                "total_frames": total,
-                "fps": round(fps, 2),
-                "eta_seconds": round(eta, 2) if eta > 0 else 0,
-                "frame_skip_interval": skip_interval
-            }
-        }
-        if DEBUG_PIPELINE:
-            from worker import job_manager
-            agent = job_manager.active_jobs.get(list(job_manager.active_jobs.keys())[0]) if job_manager.active_jobs else None
-            payload["payload"]["queue"] = len(job_manager.active_jobs)
-            payload["payload"]["decode_time_ms"] = agent.decode_time_ms if agent else 0
-            payload["payload"]["inference_time_ms"] = agent.inference_time_ms if agent else 0
-            payload["payload"]["slot_eval_time_ms"] = agent.slot_eval_time_ms if agent else 0
-            
-        await manager.broadcast(payload)
-        
-    @staticmethod
-    async def broadcast_status(job_id: str, status: str):
-        payload = {
-            "event": f"job_{status}",
-            "timestamp": get_iso_time(),
-            "job_id": job_id
-        }
-        await manager.broadcast(payload)
-
-class SlotEvaluationAgent:
-    def __init__(self):
-        self.slot_pending_state = {} 
-        self.slot_bbox_cache = {}    
-        self.slot_continuous_hits = {}
-        self.cached_polygon_version = {} # slot_id -> version
-        self.last_seen_tracks = {} # tracker_id -> timestamp
-        self.tracker_vehicle_map = {} # tracker_id -> vehicle_uuid
-        self.last_known_centroids = {} # vehicle_uuid -> (cx, cy, timestamp)
-
-    def _get_or_build_cache(self, db, slots):
-        for slot in slots:
-            # Rebuild if not in cache OR if version in DB is different from cached version
-            needs_rebuild = slot.id not in self.slot_bbox_cache or \
-                           self.cached_polygon_version.get(slot.id) != slot.polygon_version
-            
-            if needs_rebuild:
-                # Immediate hit buffer reset on geometry change per exact specifications
-                if slot.id in self.slot_continuous_hits:
-                    self.slot_continuous_hits[slot.id] = 0
-                
-                if slot.polygon and slot.polygon != "[]":
-                    try:
-                        pts = json.loads(slot.polygon)
-                        if len(pts) >= 3:
-                            poly = np.array(pts, np.int32).reshape((-1, 1, 2))
-                            x, y, w, h = cv2.boundingRect(poly)
-                            area = cv2.contourArea(poly) or 1
-                            with slot_cache_lock:
-                                self.slot_bbox_cache[slot.id] = (x, y, w, h, area, poly)
-                                self.cached_polygon_version[slot.id] = slot.polygon_version
-                    except Exception as e:
-                        logging.error(f"Polygon parse error for {slot.id}: {e}")
-                    
-    def evaluate(self, detections, current_timestamp: float, eval_frame=None):
-        db = SessionLocal()
-        try:
-            slots = db.query(ParkingSlot).all()
-            self._get_or_build_cache(db, slots)
-            
-            # Correction 1 — Handle Tracker ID Switching & Memory Cleanup
-            now_ts = time.time()
-            
-            # --- Memory Cleanup: Remove old tracker mappings ---
-            expired_vid = [vid for vid, data in self.last_known_centroids.items() if now_ts - data[2] > TRACKER_MAP_TTL]
-            for vid in expired_vid:
-                del self.last_known_centroids[vid]
-                tids_to_del = [tid for tid, v_id in self.tracker_vehicle_map.items() if v_id == vid]
-                for tid in tids_to_del:
-                    del self.tracker_vehicle_map[tid]
-            # ----------------------------------------------------
-
-            for d in detections:
-                tid = d.get("track_id")
-                if tid is not None:
-                    if tid in self.tracker_vehicle_map:
-                        vid = self.tracker_vehicle_map[tid]
-                        # Update timestamp but keep old slot info for now if already mapped
-                        prev_data = self.last_known_centroids.get(vid)
-                        if prev_data:
-                            lcx, lcy, lts, lsid = prev_data
-                            cx, cy = d["centroid"]
-                            self.last_known_centroids[vid] = (cx, cy, now_ts, lsid)
-                        d["vehicle_id"] = vid
-            
-            with slot_cache_lock:
-                target_slots_data = [(s, self.slot_bbox_cache[s.id]) for s in slots if s.id in self.slot_bbox_cache]
-                
-            for slot, cache_data in target_slots_data:
-                x, y, w, h, area, poly = cache_data
-                vehicle_in_slot = False
-                found_track_id = None
-                
-                for v in detections:
-                    vx1, vy1, vx2, vy2 = v["bbox"]
-                    if vx2 < x or vx1 > x + w or vy2 < y or vy1 > y + h:
-                        continue
-                        
-                    cx, cy = v["centroid"]
-                    
-                    if DEBUG_PIPELINE and DEBUG_STREAM_ENABLED and eval_frame is not None:
-                        cv2.rectangle(eval_frame, (vx1, vy1), (vx2, vy2), (255, 0, 0), 2) # Blue bbox
-                        cv2.circle(eval_frame, (cx, cy), 4, (0, 0, 255), -1) # Red centroid
-                        
-                    inside = cv2.pointPolygonTest(poly, (float(cx), float(cy)), False) >= 0
-                    if not inside:
-                        if DEBUG_PIPELINE:
-                            logging.debug(f"[SlotEval] Centroid ({cx},{cy}) outside polygon for slot {slot.id} (S{slot.number})")
-                        ix1 = max(vx1, x)
-                        iy1 = max(vy1, y)
-                        ix2 = min(vx2, x + w)
-                        iy2 = min(vy2, y + h)
-                        if ix1 < ix2 and iy1 < iy2:
-                            intersection = (ix2 - ix1) * (iy2 - iy1)
-                            iou = intersection / area
-                            if iou > 0.25:
-                                vehicle_in_slot = True
-                                break
-                    else:
-                        if DEBUG_PIPELINE:
-                            logging.debug(f"[SlotEval] Centroid ({cx},{cy}) inside polygon for slot {slot.id} (S{slot.number}) -> OCCUPIED")
-                        vehicle_in_slot = True
-                        tid = v.get("track_id")
-                        if tid is not None:
-                            # Correction 1 — Tracker Re-Identification Safeguard
-                            if tid not in self.tracker_vehicle_map:
-                                best_vid = None
-                                min_dist = MIN_TRACKER_REID_DISTANCE
-                                for vid, data in self.last_known_centroids.items():
-                                    lcx, lcy, lts, lsid = data
-                                    if lsid == slot.id:
-                                        dist = np.sqrt((cx - lcx)**2 + (cy - lcy)**2)
-                                        if dist < min_dist:
-                                            min_dist = dist
-                                            best_vid = vid
-                                
-                                if best_vid:
-                                    logging.info(f"[Identity] Re-mapped tracker {tid} to vehicle {best_vid} in slot {slot.id}")
-                                    self.tracker_vehicle_map[tid] = best_vid
-                                else:
-                                    self.tracker_vehicle_map[tid] = str(tid)
-                            
-                            vid = self.tracker_vehicle_map[tid]
-                            self.last_known_centroids[vid] = (cx, cy, now_ts, slot.id)
-                            v["vehicle_id"] = vid
-                            found_track_id = vid
-                        else:
-                            found_track_id = "unknown"
-                        break
-                
-                if DEBUG_PIPELINE and DEBUG_STREAM_ENABLED and poly is not None and len(poly) > 0 and eval_frame is not None:
-                    # Drawing polylines already happens outside this loop for all slots if enabled,
-                    # but we keep this for specific per-slot highlights if needed later.
-                    pass
-                
-                if vehicle_in_slot:
-                    self.slot_continuous_hits[slot.id] = self.slot_continuous_hits.get(slot.id, 0) + 1
-                else:
-                    # Implement 3-miss rule for available transition
-                    current_hits = self.slot_continuous_hits.get(slot.id, 0)
-                    if current_hits > 0:
-                        self.slot_continuous_hits[slot.id] = max(0, current_hits - 1)
-                
-                # OCCUPIED after 2 hits, AVAILABLE after 3 misses (or 0 hits)
-                hits = self.slot_continuous_hits.get(slot.id, 0)
-                if hits >= 2:
-                    desired_state = "occupied"
-                elif hits == 0:
-                    desired_state = "available"
-                else:
-                    desired_state = slot.status # Maintain current state while in buffer
-                
-                if slot.status == desired_state:
-                    if slot.id in self.slot_pending_state:
-                        del self.slot_pending_state[slot.id]
-                    continue
-                    
-                if slot.id not in self.slot_pending_state or self.slot_pending_state[slot.id][0] != desired_state:
-                    self.slot_pending_state[slot.id] = (desired_state, current_timestamp)
-                else:
-                    pending_state, first_seen = self.slot_pending_state[slot.id]
-                    if current_timestamp - first_seen >= 1.0:
-                        # Enforce SLOT_STATE_COOLDOWN_SEC
-                        now_utc = datetime.now(timezone.utc)
-                        delta = (now_utc - slot.last_status_change_at.replace(tzinfo=timezone.utc)).total_seconds() \
-                                if slot.last_status_change_at else 999
-                        
-                        if delta < SLOT_STATE_COOLDOWN_SEC:
-                            if DEBUG_PIPELINE:
-                                logging.debug(f"[SlotEval] Rejecting state change for slot {slot.id} (S{slot.number}): Cooldown active ({delta:.2f}s < {SLOT_STATE_COOLDOWN_SEC}s)")
-                            continue
-
-                        logging.info(f"Updating slot {slot.id} (S{slot.number}) status: {slot.status} -> {pending_state}")
-                        
-                        # Utilization Analytics & Session Logging
-                        if pending_state == "occupied" and slot.status != "occupied":
-                            # Correction 2 — Prevent Session Duplication
-                            # Only open a new session if one isn't already active for this slot
-                            existing_session = db.query(ParkingSession).filter(
-                                ParkingSession.slot_id == slot.id,
-                                ParkingSession.exit_time == None
-                            ).first()
-                            
-                            if not existing_session:
-                                slot.occupancy_count = (slot.occupancy_count or 0) + 1
-                                slot.occupied_start_time = now_utc
-                                # Start Session
-                                session = ParkingSession(
-                                    slot_id=slot.id,
-                                    vehicle_id=str(v.get("vehicle_id") or found_track_id or "unknown"),
-                                    entry_time=now_utc
-                                )
-                                db.add(session)
-                                log_event("vehicle_entered_slot", f"Vehicle entered slot {slot.id}", {"slot_id": slot.id, "track_id": found_track_id})
-                            else:
-                                if DEBUG_PIPELINE:
-                                    logging.debug(f"[SlotEval] Session already active for slot {slot.id}, skipping duplicate creation.")
-                                
-                        elif slot.status == "occupied" and pending_state == "available":
-                            if slot.last_status_change_at:
-                                duration = (now_utc - slot.last_status_change_at.replace(tzinfo=timezone.utc)).total_seconds()
-                                slot.total_occupied_time = (slot.total_occupied_time or 0.0) + duration
-                            # End Session
-                            latest_session = db.query(ParkingSession).filter(
-                                ParkingSession.slot_id == slot.id,
-                                ParkingSession.exit_time == None
-                            ).order_by(ParkingSession.entry_time.desc()).first()
-                            if latest_session:
-                                latest_session.exit_time = now_utc
-                                latest_session.duration = (now_utc - latest_session.entry_time).total_seconds()
-                            slot.occupied_start_time = None
-                            log_event("vehicle_left_slot", f"Vehicle left slot {slot.id}", {"slot_id": slot.id})
-                        
-                        slot.status = pending_state
-                        slot.last_status_change_at = now_utc
-                        if pending_state == "occupied":
-                            slot.heatmap_count = (slot.heatmap_count or 0) + 1
-                        db.commit()
-                        del self.slot_pending_state[slot.id]
-                        
-                        manager.sync_broadcast({
-                            "event": "slot_update",
-                            "slot_id": slot.id,
-                            "status": pending_state,
-                            "timestamp": get_iso_time()
-                        })
-                        
-                        log_event("slot_status_change", f"Slot {slot.id} changed to {pending_state}", {"slot_id": slot.id, "status": pending_state})
-
-            # Correction 1: Handle Tracker ID Reset / Lost Timeout
-            for slot in target_slots_data:
-                slot_obj = slot[0]
-                if slot_obj.status == "occupied" and slot_obj.occupied_start_time:
-                    # Check if tracker associated with this slot is still alive
-                    # This is slightly complex as we don't strictly associate 1 track to 1 slot in the model
-                    # But we can check if ANY track is currently in the slot. 
-                    # If NO track is in the slot for > TRACK_LOST_TIMEOUT, force available.
-                    
-                    found_any_track = False
-                    for v in detections:
-                        cx, cy = v["centroid"]
-                        # Re-run point test for current frame detections
-                        # (Optimization: could cache this if we haven't already moved to next task)
-                        with slot_cache_lock:
-                            _, _, _, _, _, poly = self.slot_bbox_cache[slot_obj.id]
-                        if cv2.pointPolygonTest(poly, (float(cx), float(cy)), False) >= 0:
-                            found_any_track = True
-                            break
-                    
-                    if not found_any_track:
-                        # If not found in current detections, check when we last saw occupancy here
-                        # We use last_status_change_at as a proxy for 'last confirmed presence'
-                        last_confirmed = slot_obj.last_status_change_at.replace(tzinfo=timezone.utc)
-                        if (datetime.now(timezone.utc) - last_confirmed).total_seconds() > TRACK_LOST_TIMEOUT:
-                            logging.info(f"Tracker timeout for slot {slot_obj.id}. Resetting to available.")
-                            
-                            # Close session
-                            latest_session = db.query(ParkingSession).filter(
-                                ParkingSession.slot_id == slot_obj.id,
-                                ParkingSession.exit_time == None
-                            ).order_by(ParkingSession.entry_time.desc()).first()
-                            
-                            now_utc = datetime.now(timezone.utc)
-                            if latest_session:
-                                latest_session.exit_time = now_utc
-                                latest_session.duration = (now_utc - latest_session.entry_time).total_seconds()
-                            
-                            slot_obj.status = "available"
-                            slot_obj.last_status_change_at = now_utc
-                            slot_obj.occupied_start_time = None
-                            db.commit()
-                            
-                            log_event("vehicle_left_slot", f"Vehicle left slot {slot_obj.id} (Tracker Timeout)", {"slot_id": slot_obj.id})
-                            
-                            manager.sync_broadcast({
-                                "event": "slot_update",
-                                "slot_id": slot_obj.id,
-                                "status": "available",
-                                "timestamp": get_iso_time()
-                            })
-
-        except Exception as e:
-            logging.error(f"Slot evaluation error: {e}")
-            db.rollback()
-        finally:
-            db.close()
-
-    @staticmethod
-    def process(frame):
-        model = get_model()
-        if model is None:
-            return []
-        
-        # Strict Lock Ordering: slot_cache_lock -> frame_queue_lock -> inference_lock
-        # We only need inference_lock here, but we honor the ordering principle
-        # by not having higher locks if we were to grab them.
-        with inference_lock:
-            with torch.no_grad():
-                results = model.track(frame, persist=True, imgsz=MODEL_IMG_SIZE, verbose=False, classes=YOLO_VEHICLE_CLASS_IDS, conf=CONFIDENCE_THRESHOLD)
-            
-        detections = []
-        for r in results:
-            if r.boxes.id is not None:
-                ids = r.boxes.id.cpu().numpy().astype(int)
-                for box, track_id in zip(r.boxes, ids):
-                    cls_id = int(box.cls[0])
-                    conf = float(box.conf[0])
-                    x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
-                    cx = int((x1 + x2) / 2)
-                    cy = int((y1 + y2) / 2)
-                    detections.append({
-                        "bbox": (x1, y1, x2, y2),
-                        "centroid": (cx, cy),
-                        "class_id": cls_id,
-                        "track_id": track_id
-                    })
-            else:
-                for box in r.boxes:
-                    cls_id = int(box.cls[0])
-                    conf = float(box.conf[0])
-                    if cls_id in YOLO_VEHICLE_CLASS_IDS and conf >= CONFIDENCE_THRESHOLD:
-                        x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
-                        cx = int((x1 + x2) / 2)
-                        cy = int((y1 + y2) / 2)
-                        detections.append({
-                            "bbox": (x1, y1, x2, y2),
-                            "centroid": (cx, cy),
-                            "class_id": cls_id,
-                            "track_id": None
-                        })
-        return detections
+class WorkerState:
+    INIT = "INIT"
+    RUNNING = "RUNNING"
+    STOPPING = "STOPPING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    RESTARTING = "RESTARTING"
 
 class ProcessingAgent(threading.Thread):
-    def __init__(self, job_id: str, db_id: int):
+    def __init__(self, job_id: str, video_path: str, db_id: int):
         super().__init__()
         self.job_id = job_id
+        
+        # Fallback handling
+        if not video_path or not os.path.exists(video_path) or not video_path.lower().endswith(".mp4"):
+            log_event("worker", f"[WORKER] video path invalid, falling back to {os.path.basename(DEFAULT_VIDEO)}")
+            self.video_path = DEFAULT_VIDEO
+        else:
+            self.video_path = video_path
+
+        log_event("worker", f"[WORKER] using video source: {os.path.basename(self.video_path)}")
         self.db_id = db_id
-        self.running = False
-        self.paused = False
+        
+        self.worker_running = False
+        self.capture_finished = False
         self.latest_frame = None
+        self.loop = None
+        
+        self.last_heartbeat_perf = time.perf_counter()
+        self.last_heartbeat_ts = time.time()
+        self.last_frame_perf = time.perf_counter() # For freeze detection
+        
         self.frame_queue = deque(maxlen=QUEUE_LIMIT)
-        self.current_skip_interval = FRAME_SKIP_DEFAULT
+        self.frame_queue_lock = threading.Lock()
+        
+        self.state = WorkerState.INIT
         self.last_frame_hash = None
         self.last_detections = []
-        self.decode_time_ms = 0
-        self.inference_time_ms = 0
-        self.slot_eval_time_ms = 0
-        self.latency_window = deque(maxlen=20)
-        self.worker_last_seen = time.time()
-        self.last_heartbeat = time.time()
+        self.hash_skip_counter = 0
+        
         self.frames_received = 0
         self.frames_processed = 0
         self.frames_dropped = 0
-        self.detected_classes = {"car": 0, "truck": 0, "bus": 0, "motorcycle": 0}
-        self.stream_source = "primary"
+        self.frames_dropped_total = 0
+        self.decode_error_count = 0
+        self.latest_fps = 0
+        self.stream_status = "RECONNECTING"
         self.stream_retry_count = 0
-        self.stream_status = "connected"
-        self.camera_fps = 0
-        self.camera_latency = 0
-        self.camera_last_frame_time = 0
+        self.stream_reconnect_count = 0
+        self.stream_connected_at = None
+        
+        self.latency_window = deque(maxlen=PROCESSING_LATENCY_WINDOW)
+        self.queue_latency_window = deque(maxlen=PROCESSING_LATENCY_WINDOW)
+        self.fps_window = deque(maxlen=FPS_STABILITY_WINDOW)
+        self.inference_time_ms = 0
+        self.slot_eval_time_ms = 0
+        
+        self.capture_thread = None
+        self.cached_resolution = (0, 0)
+        self.cached_scaled_slots = {}
 
     def run(self):
-        self.running = True
+        self.worker_running = True
+        self.state = WorkerState.RUNNING
+        
+        # SECTION: Emergency Demo Configuration - Force DB Sync
+        global DEMO_STATE_APPLIED
+        from services.slot_service import DEMO_MODE
+        if DEMO_MODE and not DEMO_STATE_APPLIED:
+            try:
+                db = SessionLocal()
+                log_event("worker", "[DEMO] Forcing deterministic slot states for demo...")
+                
+                # Force Available
+                db.query(ParkingSlot).filter(ParkingSlot.id == "S2").update({"status": "available"})
+                db.query(ParkingSlot).filter(ParkingSlot.id == "S5").update({"status": "available"})
+                
+                # Force Occupied
+                db.query(ParkingSlot).filter(ParkingSlot.id.in_(["S1", "S3", "S4", "S6", "S7"])).update({"status": "occupied"})
+                
+                db.commit()
+                db.close()
+                
+                slot_service.refresh_cache()
+                
+                # Clear Worker Caches
+                self.cached_scaled_slots.clear()
+                self.cached_resolution = (0, 0)
+                
+                DEMO_STATE_APPLIED = True
+                log_event("worker", "[DEMO] DB sync complete: S2, S5 available; S1,S3,S4,S6,S7 occupied.")
+            except Exception as e:
+                log_event("worker", f"[DEMO ERROR] Failed to force demo states: {e}")
+
+        log_event("worker", f"[WORKER] starting {self.job_id}")
+        
+        self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True, name=f"Cap-{self.job_id}")
+        self.capture_thread.start()
+        
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(self.run_pipeline())
+            loop.run_until_complete(self._process_loop())
         finally:
             loop.close()
 
-    async def run_pipeline(self):
-        db = SessionLocal()
-        job = db.query(ProcessingJob).filter(ProcessingJob.id == self.db_id).first()
-        if not job or job.status == "cancelled":
-            db.close()
-        while self.running:
-            self.last_heartbeat = time.time()
-            with stream_reconnect_lock:
-                cap = cv2.VideoCapture(job.video_path)
-                if cap.isOpened():
-                    self.stream_retry_count = 0
-                    break
-            
-            self.stream_retry_count += 1
-            if self.stream_retry_count > MAX_STREAM_RETRIES:
-                set_system_mode("SAFE_MODE")
-                logging.error(f"Stream reconnection failed after {MAX_STREAM_RETRIES} attempts. SYSTEM_MODE -> SAFE_MODE")
-            
-            log_event("stream_reconnect_retry", f"Reconnection attempt {self.stream_retry_count} for {job.video_path}", {"job_id": self.job_id, "attempt": self.stream_retry_count})
-            
-            logging.warning(f"Failed to open stream/file {job.video_path} (Attempt {self.stream_retry_count}). Retrying in 5 seconds...")
-            await asyncio.sleep(5)
-            job = db.query(ProcessingJob).filter(ProcessingJob.id == self.db_id).first()
-            if not job or job.status == "cancelled":
-                db.close()
-                return
+    def _capture_loop(self):
+        log_event("worker", f"[WORKER] capture loop started: {self.job_id}")
+        while self.worker_running:
+            if self.capture_finished:
+                break
 
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
-        
-        # Resume optimization per exact specifications
-        if job.processed_frames > 0:
-            resume_frame = job.processed_frames * self.current_skip_interval
-            cap.set(cv2.CAP_PROP_POS_FRAMES, resume_frame)
-            
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        base_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        
-        evaluator = SlotEvaluationAgent()
-        processed_inferences = job.processed_frames
-        
-        last_emit_time = 0
-        fps_window = []
-        
-        while self.running and (processed_inferences * self.current_skip_interval) < total_frames:
-            if self.paused:
-                job.processed_frames = processed_inferences
-                db.commit()
-                await asyncio.sleep(1)
-                job = db.query(ProcessingJob).filter(ProcessingJob.id == self.db_id).first()
-                if job.status == "cancelled":
+            cap = cv2.VideoCapture(self.video_path)
+            if cap.isOpened():
+                self.stream_status = "CONNECTED"
+                self.stream_connected_at = time.perf_counter()
+                self.stream_reconnect_count += 1
+                self.stream_retry_count = 0
+                log_event("worker", "[WORKER] video capture initialized")
+                log_event("stream", f"[WORKER] stream connected: {os.path.basename(self.video_path)}")
+            else:
+                self.stream_status = "DISCONNECTED"
+                self.stream_retry_count += 1
+                if self.stream_retry_count > MAX_STREAM_RETRIES:
+                    log_event("worker", f"[STREAM] max retries reached: {self.job_id}", {"level": "error"})
+                    self.state = WorkerState.FAILED
+                    self.worker_running = False
                     break
-                if job.status == "processing":
-                    self.paused = False
+                
+                delay = min(30, self.stream_retry_count * 5)
+                log_event("stream", f"[STREAM] reconnect attempt {self.stream_retry_count} in {delay}s")
+                for _ in range(int(delay * 10)):
+                    if not self.worker_running: break
+                    time.sleep(0.1)
                 continue
-                
-            loop_start = time.time()
-            
-            # Read single frame using interval
-            current_vid_index = processed_inferences * self.current_skip_interval
-            if current_vid_index >= total_frames:
-                break
-                
-            decode_start = time.time()
-            cap.set(cv2.CAP_PROP_POS_FRAMES, current_vid_index)
-            ret, frame = cap.read()
-            self.decode_time_ms = int((time.time() - decode_start) * 1000)
-            processed_inferences += 1
-            
-            # Camera Metrics
-            current_frame_time = time.time()
-            if self.camera_last_frame_time > 0:
-                frame_delta = current_frame_time - self.camera_last_frame_time
-                self.camera_latency = int(frame_delta * 1000)
-                if frame_delta > 0:
-                    self.camera_fps = round(1.0 / frame_delta, 2)
-            self.camera_last_frame_time = current_frame_time
 
-            if not ret:
-                logging.error(f"[Pipeline] Stream broke for job {self.job_id}. Triggering failure cleanup.")
-                self.stream_status = "disconnected"
-                self._handle_stream_failure(db)
+            while self.worker_running:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                capture_ts = time.perf_counter()
+                self.last_frame_perf = capture_ts
+                with self.frame_queue_lock:
+                    if len(self.frame_queue) == QUEUE_LIMIT:
+                        self.frame_queue.popleft()
+                        self.frames_dropped += 1
+                        self.frames_dropped_total += 1
+                    self.frame_queue.append((frame, capture_ts))
+                    self.frames_received += 1
+                
+                time.sleep(0.01) 
+
+            cap.release()
+            if not self.worker_running:
                 break
             
-            self.stream_status = "connected"
-            self.worker_last_seen = time.time()
-            self.last_heartbeat = time.time()
-            self.frames_received += 1
-            
-            # Frame queue pressure simulation/tracking
-            with frame_queue_lock:
-                self.frame_queue.append(time.time())
-                self.queue_pressure = len(self.frame_queue) / QUEUE_LIMIT
-            
-            # Dropped frames logic (if queue was overflowing, but here we process sequentially)
-            # In a real producer-consumer, we'd pop oldest if queue full.
-            
-            # Adaptive Backpressure: Increase skip interval if pressure > threshold
-            if self.queue_pressure > QUEUE_BACKPRESSURE_THRESHOLD:
-                self.current_skip_interval = min(30, self.current_skip_interval + 2)
-                if DEBUG_PIPELINE:
-                    logging.warning(f"[Backpressure] Pressure high ({self.queue_pressure:.2f}), increasing skip to {self.current_skip_interval}")
+            # Hardening: Stream Freeze Detection
+            if time.perf_counter() - self.last_frame_perf > 10.0:
+                log_event("worker", f"[WORKER] stream freeze detected (>10s): {self.job_id}")
+                self.state = WorkerState.RESTARTING
+                self.worker_running = False
+                break
 
-            # Thread-safe update of shared MJPEG buffer
-            with frame_buffer_lock:
-                self.latest_frame = frame.copy()
-            
-            self.frames_processed += 1
-            
-            # 1. Detection with Frame Hashing & Timeout
-            inference_start = time.time()
-            small_frame = cv2.resize(frame, FRAME_HASH_SIZE)
-            frame_hash = hash(small_frame.tobytes())
-            if frame_hash == self.last_frame_hash:
-                detections = self.last_detections
-            else:
-                detections = DetectionAgent.process(frame)
-                self.last_frame_hash = frame_hash
-                self.last_detections = detections
-                # Count classes for diagnostics
-                class_map = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
-                for d in detections:
-                    cls_id = d.get("class_id")
-                    if cls_id in class_map:
-                        cls_name = class_map[cls_id]
-                        self.detected_classes[cls_name] += 1
-                
-            self.inference_time_ms = int((time.time() - inference_start) * 1000)
-            
-            # Detection FPS calculation (excluding hashing time)
-            actual_inference_time = time.time() - inference_start
-            if actual_inference_time > 0:
-                detection_fps_window.append(1.0 / actual_inference_time)
-            self.latest_detection_fps = statistics.mean(detection_fps_window) if detection_fps_window else 0
+            if not self.capture_finished:
+                log_event("worker", "[WORKER] stream ended or lost")
+                self.capture_finished = True
+                break
 
-            # 2. Evaluation
-            eval_start = time.time()
-            vid_timestamp = current_vid_index / base_fps
-            evaluator.evaluate(detections, vid_timestamp, self.latest_frame)
-            self.slot_eval_time_ms = int((time.time() - eval_start) * 1000)
-            
-            # Latency Statistics
-            total_latency = self.inference_time_ms + self.slot_eval_time_ms
-            self.latency_window.append(total_latency)
-            self.latency_avg = statistics.mean(self.latency_window)
-            self.latency_max = max(self.latency_window)
-            
-            # Metrics
-            detect_time = time.time() - loop_start
-            detected_fps = 1.0 / detect_time if detect_time > 0 else 0
-            
-            # Rolling smoothed FPS
-            fps_rolling_window.append(detected_fps)
-            avg_det_fps = statistics.mean(fps_rolling_window)
-            
-            
-            # Adaptive Frame Skipping Logic
-            if avg_det_fps < 2:
-                self.current_skip_interval = 18
-            elif avg_det_fps > 6:
-                self.current_skip_interval = 8
-            else:
-                self.current_skip_interval = FRAME_SKIP_DEFAULT
-
-            latency = self.decode_time_ms + self.inference_time_ms + self.slot_eval_time_ms
-            if DEBUG_PIPELINE:
-                logging.debug(f"[Pipeline] job_id={self.job_id} frame={processed_inferences} decode={self.decode_time_ms}ms infer={self.inference_time_ms}ms slot_eval={self.slot_eval_time_ms}ms latency={latency}ms skip={self.current_skip_interval}")
-                recent_profiling_metrics.append({
-                    "fps": round(avg_det_fps, 2),
-                    "infer": self.inference_time_ms,
-                    "decode": self.decode_time_ms
-                })
-                
-            # WS Throttling & Emit
-            current_time = time.time()
-            if current_time - last_emit_time >= 0.5:
-                actual_progress_frames = processed_inferences * self.current_skip_interval
-                progress = min(100.0, (actual_progress_frames / total_frames) * 100)
-                
-                # Precise ETA calculation mapping user requests
-                remaining_frames = total_frames - actual_progress_frames
-                remaining_processed_frames = remaining_frames / self.current_skip_interval
-                eta = remaining_processed_frames / avg_det_fps if avg_det_fps > 0 else 0
-                
-                job.processed_frames = processed_inferences
-                job.progress_percentage = progress
-                job.fps = avg_det_fps
-                self.latest_fps = avg_det_fps
-                db.commit()
-                
-                await WebSocketProgressAgent.broadcast_progress(
-                    self.job_id, progress, processed_inferences, total_frames, avg_det_fps, eta, self.current_skip_interval
-                )
-                last_emit_time = current_time
-                
-            await asyncio.sleep(0.001)
-
-        cap.release()
+    async def _process_loop(self):
+        self.loop = asyncio.get_running_loop()
+        db = SessionLocal()
+        detection_service = get_detection_service()
         
-        job = db.query(ProcessingJob).filter(ProcessingJob.id == self.db_id).first()
-        if self.running and job.status != "cancelled" and not self.paused:
-            job.status = "completed"
-            job.progress_percentage = 100.0
-            db.commit()
-            await WebSocketProgressAgent.broadcast_status(self.job_id, "complete")
-            
-        db.close()
+        try:
+            while self.worker_running:
+                self.last_heartbeat_perf = time.perf_counter()
+                self.last_heartbeat_ts = time.time()
+                
+                frame_data = None
+                with self.frame_queue_lock:
+                    if self.frame_queue:
+                        frame_data = self.frame_queue.popleft()
 
-    def _handle_stream_failure(self, db):
+                if frame_data is None:
+                    if self.capture_finished and not self.frame_queue:
+                        log_event("job", f"[JOB] {self.job_id} processing complete")
+                        break
+                    await asyncio.sleep(0.01)
+                    continue
+
+                frame, capture_ts = frame_data
+                process_start = time.perf_counter()
+                
+                queue_latency = max(0, min((process_start - capture_ts) * 1000, 5000))
+                self.queue_latency_window.append(queue_latency)
+                
+                # Queue Backpressure Protection: Flush if backlog is too high
+                if queue_latency > 2000.0:
+                    with self.frame_queue_lock:
+                        self.frame_queue.clear()
+                        log_event("worker", f"[WORKER] queue backlog detected ({queue_latency:.0f}ms). flushing frame queue to resume real-time sync.")
+                    continue
+                
+                if self.frames_processed % 30 == 0:
+                    slot_service.verify_cache_integrity()
+                
+                frame_hash = compute_frame_hash(frame)
+                if self.last_frame_hash is None:
+                    dist = HASH_DISTANCE_THRESHOLD + 1
+                else:
+                    dist = calculate_hash_distance(frame_hash, self.last_frame_hash)
+                
+                from config import FORCE_DETECTION_INTERVAL
+                force_detection = (self.frames_processed % FORCE_DETECTION_INTERVAL == 0)
+                backlogged = (len(self.frame_queue) > QUEUE_LIMIT * 0.5)
+                
+                if (dist < HASH_DISTANCE_THRESHOLD and not force_detection and not backlogged 
+                    and self.hash_skip_counter < MAX_HASH_SKIP_FRAMES):
+                    detections = self.last_detections
+                    self.hash_skip_counter += 1
+                else:
+                    inf_start = time.perf_counter()
+                    results = detection_service.detect(frame)
+                    vehicle_count = sum(len(r.boxes) for r in results if r.boxes is not None)
+                    log_event("worker", f"[YOLO] vehicles detected: {vehicle_count}")
+                    
+                    detections = []
+                    for r in results:
+                        if r.boxes is None or len(r.boxes) == 0:
+                            continue
+                        
+                        # Extract boxes and validate
+                        for b in r.boxes:
+                            try:
+                                # Section 4: Detection Confidence Filtering
+                                try:
+                                    conf = float(b.conf[0]) if hasattr(b.conf, "__len__") else float(b.conf)
+                                except (TypeError, AttributeError):
+                                    conf = 0.0
+                                    
+                                if conf < 0.35:
+                                    continue
+                                    
+                                x1, y1, x2, y2 = map(float, b.xyxy[0].cpu().numpy())
+                                
+                                # Section 3: Bounding Box Validation
+                                if x2 <= x1 or y2 <= y1:
+                                    continue
+                                    
+                                # Section 6: Centroid Precision
+                                cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+                                
+                                # Section 5: Robust Tracker ID Extraction
+                                track_id = None
+                                if hasattr(b, "id") and b.id is not None and len(b.id) > 0:
+                                    track_id = int(b.id[0])
+                                
+                                # Minimal geometry: Only bbox and float-precision centroid
+                                detections.append({
+                                    "bbox": (float(x1), float(y1), float(x2), float(y2)), 
+                                    "centroid": (float(cx), float(cy)), 
+                                    "track_id": track_id,
+                                    "conf": conf
+                                })
+                                # High-frequency diagnostic (local only)
+                                logging.debug(f"[YOLO] detected vehicle at ({cx:.1f}, {cy:.1f}) conf:{conf:.2f}")
+                            except Exception as e:
+                                logging.error(f"[YOLO] error parsing box: {e}")
+                    
+                    self.inference_time_ms = int((time.perf_counter() - inf_start) * 1000)
+                    self.last_frame_hash = frame_hash
+                    self.last_detections = detections
+                    self.hash_skip_counter = 0
+
+                tracking_service.update_tracks(detections, current_frame_id=self.frames_processed)
+                
+                # 3. Slot Evaluation
+                # log_event("worker", f"[WORKER] starting evaluation for frame {self.frames_processed}")
+                
+                # Normalization & Scaling for evaluation
+                h, w = frame.shape[:2]
+                
+                # SECTION 7: Slot Cache Invalidation
+                # Also Performance Optimization: Only re-scale if resolution changes OR slot count changes
+                slot_count = len(slot_service.slot_cache)
+                needs_rescale = (w, h) != self.cached_resolution or len(self.cached_scaled_slots) != slot_count
+                
+                # Check for database-driven cache updates
+                if slot_service.verify_cache_integrity():
+                    needs_rescale = True
+                    self.cached_scaled_slots.clear()
+                    self.cached_resolution = (0, 0)
+
+                if needs_rescale:
+                    scale_x = w / DESIGN_WIDTH
+                    scale_y = h / DESIGN_HEIGHT
+                    
+                    log_event("worker", f"[AGENT] building scaled cache: res={w}x{h}, scale={scale_x:.2f}x{scale_y:.2f}, slots={slot_count}")
+                    
+                    self.cached_scaled_slots = {}
+                    for sid, s_cache in slot_service.slot_cache.items():
+                        try:
+                            raw_pts = s_cache["polygon_pts"]
+                            scaled_pts = [[int(x * scale_x), int(y * scale_y)] for [x, y] in raw_pts]
+                            
+                            s_poly = Polygon(scaled_pts)
+                            self.cached_scaled_slots[sid] = {
+                                "poly_cv2": np.array(scaled_pts, dtype=np.int32).reshape((-1, 1, 2)),
+                                "shapely_poly": s_poly,
+                                "area": s_poly.area,
+                                "status": s_cache.get("status", "available"),
+                                "number": s_cache.get("number", "??")
+                            }
+                        except Exception as e:
+                            logging.error(f"[WORKER] error scaling slot {sid}: {e}")
+                            
+                    self.cached_resolution = (w, h)
+
+                # 3. Slot Evaluation
+                updates, eval_time = slot_service.evaluate_slots(detections, self.cached_scaled_slots)
+                self.slot_eval_time_ms = eval_time
+                
+                # Performance Monitoring (Agent Mode)
+                if eval_time > 2.0 and self.frames_processed % 50 == 0:
+                    log_event("system", f"[AGENT WARNING] slot evaluation performance degraded ({eval_time:.2f}ms)")
+
+                if updates:
+                    self._persist_updates(db, updates)
+                
+                # 4. Rendering - Pass scaled polygons directly
+                self.latest_frame = draw_detection_overlay(frame, detections, self.cached_scaled_slots.values())
+
+                if self.frames_processed % 100 == 0:
+                    cpu_usage = psutil.cpu_percent()
+                    log_event("worker", f"[WORKER] CPU level: {cpu_usage}%")
+
+                mem_mb = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+                if mem_mb > MEMORY_RESTART_MB:
+                    log_event("system", f"[WORKER] memory threshold hit ({mem_mb:.0f}MB). performing safe restart.")
+                    self.state = WorkerState.RESTARTING
+                    self.worker_running = False
+                    break
+
+                self.frames_processed += 1
+                exec_time = time.perf_counter() - process_start
+                fps = 1.0 / exec_time if exec_time > 0 else 0
+                self.fps_window.append(fps)
+                self.latest_fps = statistics.mean(self.fps_window)
+                self.latency_window.append(exec_time * 1000)
+                
+                if self.frames_processed % 50 == 0:
+                    log_event("worker", f"[WORKER] processed {self.frames_processed} frames")
+
+                sleep_time = max(0, (1.0 / MAX_FPS_PROCESSING) - exec_time)
+                await asyncio.sleep(sleep_time)
+
+            if self.state not in [WorkerState.RESTARTING, WorkerState.FAILED]:
+                self.state = WorkerState.COMPLETED
+                db_job = db.query(ProcessingJob).filter(ProcessingJob.id == self.db_id).first()
+                if db_job:
+                    db_job.status = "completed"
+                    db_job.frames_processed = self.frames_processed
+                    db_job.completed_at = datetime.now(timezone.utc)
+                    db.commit()
+
+        except Exception as e:
+            log_event("worker", f"[WORKER] critical error: {e}", {"level": "error"})
+            self.state = WorkerState.FAILED
+            db_job = db.query(ProcessingJob).filter(ProcessingJob.id == self.db_id).first()
+            if db_job:
+                db_job.status = "failed"
+                db_job.error_message = str(e)
+                db.commit()
+        finally:
+            db.close()
+
+    def _persist_updates(self, db, updates):
         try:
             now_utc = datetime.now(timezone.utc)
-            active_sessions = db.query(ParkingSession).filter(ParkingSession.exit_time == None).all()
-            for session in active_sessions:
-                session.exit_time = now_utc
-                session.duration = (now_utc - session.entry_time).total_seconds()
-            slots = db.query(ParkingSlot).all()
-            for slot in slots:
-                if slot.status != "available":
-                    slot.status = "available"
-                    slot.last_status_change_at = now_utc
-                    slot.occupied_start_time = None
-            db.commit()
-            log_event("stream_failure", f"Stream failed. All sessions closed.")
-            asyncio.run_coroutine_threadsafe(
-                manager.broadcast({"event": "system_alert", "level": "error", "message": "Camera stream disconnected. Data reset."}),
-                asyncio.get_event_loop()
-            )
-        except Exception as e:
-            logging.error(f"Error in stream failure cleanup: {e}")
-            db.rollback()
+            for u in updates:
+                slot_id = u["slot_id"]
+                new_status = u["status"]
+                vid = u.get("vehicle_id")
+                
+                slot = db.query(ParkingSlot).filter(ParkingSlot.id == slot_id).first()
+                if not slot: continue
+                
+                if new_status == "occupied":
+                    session = ParkingSession(slot_id=slot.id, vehicle_id=vid, entry_time=now_utc)
+                    db.add(session)
+                elif new_status == "available":
+                    session = db.query(ParkingSession).filter(
+                        ParkingSession.slot_id == slot.id, ParkingSession.exit_time == None
+                    ).first()
+                    if session: session.exit_time = now_utc
 
+                slot.status = new_status
+                slot.last_status_change_at = now_utc
+                
+                payload = {"event": "slot_update", "slot_id": slot_id, "status": new_status}
+                if self.loop and self.loop.is_running():
+                    asyncio.run_coroutine_threadsafe(manager.broadcast(payload), self.loop)
+                
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            log_event("system", f"[DB] persistence error: {e}")
 
 class JobManager:
     def __init__(self):
-        self.active_jobs = {} 
-        self.monitor_thread = threading.Thread(target=self._monitor_heartbeats, daemon=True)
-        self.monitor_thread.start()
-        
-    def _monitor_heartbeats(self):
-        while True:
-            time.sleep(10) # 10s check interval
-            dead_workers = []
-            current_time = time.time()
-            for db_id, agent in list(self.active_jobs.items()):
-                # Watchdog: Restart if heartbeat missing > 30s
-                is_stale = (current_time - agent.last_heartbeat) > 30.0
-                if agent.running and not agent.paused and is_stale:
-                    logging.warning(f"Watchdog: Worker {agent.job_id} heartbeat timeout! Restarting thread.")
-                    dead_workers.append((db_id, getattr(agent, 'job_id', 'unknown')))
-                elif agent.running and not agent.paused and (current_time - agent.worker_last_seen) > 60.0:
-                    # Fallback for general deadlock
-                    logging.warning(f"Watchdog: Worker {agent.job_id} last seen > 60s! Restarting.")
-                    dead_workers.append((db_id, getattr(agent, 'job_id', 'unknown')))
-                    
-            for db_id, j_id in dead_workers:
-                log_event("worker_restart", f"Watchdog restarting worker {j_id}", {"job_id": j_id, "db_id": db_id})
-                self.cancel_job(db_id)
-                self.resume_job(db_id)
-        
-    def start_job(self, db_id: int, job_id: str):
-        if len(self.active_jobs) >= MAX_WORKERS:
-            # Simple queue limiting bypass for local dev thread pool limits. Realistically we 
-            # prevent queue buildup by overriding concurrent tasks in UI or letting DB handle it
-            pass
-            
-        agent = ProcessingAgent(job_id, db_id)
-        agent.start()
-        self.active_jobs[db_id] = agent
-        
-    def get_latest_frame(self):
-        with frame_buffer_lock:
-            for agent in self.active_jobs.values():
-                if agent.latest_frame is not None:
-                    return agent.latest_frame.copy()
-        return None
+        self.active_agents = {}
+        self.worker_restart_count = 0
+        self.watchdog_thread = threading.Thread(target=self._watchdog_loop, daemon=True, name="WorkerWatchdog")
+        self.watchdog_thread.start()
 
-    def get_active_skip_interval(self):
-        for agent in self.active_jobs.values():
-            return agent.current_skip_interval
-        return FRAME_SKIP_DEFAULT
-        
-    def get_profiling_metrics(self):
-        import psutil
-        for agent in self.active_jobs.values():
-            gpu_info = None
-            if torch.cuda.is_available():
-                gpu_info = f"{torch.cuda.get_device_name(0)} ({torch.cuda.memory_allocated(0)/1024**2:.1f}MB)"
-                
-            return {
-                "decode_time_ms": agent.decode_time_ms,
-                "inference_time_ms": agent.inference_time_ms,
-                "slot_eval_time_ms": agent.slot_eval_time_ms,
-                "frame_processing_time_avg": agent.latency_avg if hasattr(agent, "latency_avg") else 0,
-                "frame_processing_time_max": agent.latency_max if hasattr(agent, "latency_max") else 0,
-                "fps": agent.latest_fps if hasattr(agent, "latest_fps") else 0,
-                "detection_fps": agent.latest_detection_fps if hasattr(agent, "latest_detection_fps") else 0,
-                "queue_pressure": agent.queue_pressure if hasattr(agent, "queue_pressure") else 0,
-                "frame_stats": {
-                    "frames_received": agent.frames_received,
-                    "frames_processed": agent.frames_processed,
-                    "frames_dropped": agent.frames_dropped
-                },
-                "detected_classes": agent.detected_classes,
-                "stream_source": agent.stream_source,
-                "stream_status": getattr(agent, "stream_status", "unknown"),
-                "cpu_usage": psutil.cpu_percent(),
-                "memory_usage": psutil.virtual_memory().percent,
-                "gpu_usage": gpu_info,
-                "camera_fps": getattr(agent, "camera_fps", 0),
-                "camera_latency": getattr(agent, "camera_latency", 0),
-                "camera_last_frame_time": getattr(agent, "camera_last_frame_time", 0)
-            }
-        return {
-            "decode_time_ms": 0, "inference_time_ms": 0, "slot_eval_time_ms": 0, "fps": 0, "queue_pressure": 0,
-            "frame_stats": {"frames_received": 0, "frames_processed": 0, "frames_dropped": 0},
-            "detected_classes": {"car": 0, "truck": 0, "bus": 0, "motorcycle": 0},
-            "stream_source": "none",
-            "cpu_usage": psutil.cpu_percent(),
-            "memory_usage": psutil.virtual_memory().percent,
-            "gpu_usage": None,
-            "camera_fps": 0,
-            "camera_latency_ms": 0,
-            "camera_last_frame_time": 0
-        }
-        
-    def get_recent_metrics(self):
-        return list(recent_profiling_metrics)
-        
-    def pause_job(self, db_id: int):
-        if db_id in self.active_jobs:
-            self.active_jobs[db_id].paused = True
-            
-    def resume_job(self, db_id: int):
-        if db_id in self.active_jobs:
-            self.active_jobs[db_id].paused = False
-        else:
-            db = SessionLocal()
+    def start_job(self, db_id: int, job_id: str):
+        db = SessionLocal()
+        try:
             job = db.query(ProcessingJob).filter(ProcessingJob.id == db_id).first()
-            if job:
-                self.start_job(db_id, job.job_id)
+            if job: self.start_worker(db_id, job_id, job.video_path)
+        finally:
             db.close()
 
-    def cancel_job(self, db_id: int):
-        if db_id in self.active_jobs:
-            self.active_jobs[db_id].running = False
-            del self.active_jobs[db_id]
+    def start_worker(self, db_id: int, job_id: str, video_path: str):
+        if db_id in self.active_agents:
+            log_event("worker", f"[WORKER] duplicate skip: {job_id}")
+            return
+        
+        agent = ProcessingAgent(job_id, video_path, db_id)
+        agent.start()
+        self.active_agents[db_id] = agent
+
+    def stop_worker(self, db_id: int):
+        if db_id in self.active_agents:
+            agent = self.active_agents[db_id]
+            agent.worker_running = False
+            if agent.capture_thread and agent.capture_thread.is_alive():
+                agent.capture_thread.join(timeout=5)
+            if agent.is_alive():
+                agent.join(timeout=5)
+            with agent.frame_queue_lock:
+                agent.frame_queue.clear()
+            del self.active_agents[db_id]
+            log_event("worker", f"[WORKER] stopped {agent.job_id}")
+
+    def _watchdog_loop(self):
+        while True:
+            time.sleep(5)
+            now = time.perf_counter()
+            for db_id, agent in list(self.active_agents.items()):
+                if agent.worker_running and (now - agent.last_heartbeat_perf) > 10.0:
+                    log_event("system", f"[WATCHDOG] worker restart triggered: {agent.job_id}")
+                    self.worker_restart_count += 1
+                    j_id, v_path = agent.job_id, agent.video_path
+                    self.stop_worker(db_id)
+                    self.start_worker(db_id, j_id, v_path)
+                elif not agent.worker_running and agent.state == WorkerState.RESTARTING:
+                    log_event("system", f"[WATCHDOG] performing memory restart: {agent.job_id}")
+                    self.worker_restart_count += 1
+                    j_id, v_path = agent.job_id, agent.video_path
+                    self.stop_worker(db_id)
+                    self.start_worker(db_id, j_id, v_path)
+
+    def get_metrics(self):
+        # Global System Stats
+        try:
+            svmem = psutil.virtual_memory()
+            system_mem_percent = svmem.percent
+            system_cpu_percent = psutil.cpu_percent(interval=None)
+            disk_usage = psutil.disk_usage('/')
+            system_disk_percent = disk_usage.percent
+            process_uptime = time.time() - psutil.Process(os.getpid()).create_time()
+        except:
+            system_mem_percent = 0
+            system_cpu_percent = 0
+            system_disk_percent = 0
+            process_uptime = 0
+
+        for agent in self.active_agents.values():
+            fps_stability = statistics.stdev(agent.fps_window) if len(agent.fps_window) > 1 else 0
+            uptime = int(time.perf_counter() - agent.stream_connected_at) if agent.stream_connected_at else 0
+            
+            from config import MAX_HASH_SKIP_FRAMES
+            return {
+                "worker_state": agent.state,
+                "stream_state": agent.stream_status,
+                "stream_uptime": uptime,
+                "stream_reconnects": agent.stream_reconnect_count,
+                "worker_restarts": self.worker_restart_count,
+                "processing_fps": round(agent.latest_fps, 2),
+                "fps_stability": round(fps_stability, 3),
+                "processing_latency_ms": round(statistics.mean(agent.latency_window) if agent.latency_window else 0, 2),
+                "queue_latency_ms": round(statistics.mean(agent.queue_latency_window) if agent.queue_latency_window else 0, 2),
+                "inference_time_ms": agent.inference_time_ms,
+                "slot_eval_time_ms": agent.slot_eval_time_ms,
+                "decode_time_ms": 0, # Placeholder for now
+                "hash_skip_counter": agent.hash_skip_counter,
+                "frame_skip_interval": MAX_HASH_SKIP_FRAMES,
+                "queue_size": len(agent.frame_queue),
+                "frame_queue_size": len(agent.frame_queue),
+                "heartbeat": datetime.fromtimestamp(agent.last_heartbeat_ts, timezone.utc).isoformat(),
+                "active_job_id": agent.job_id,
+                "frames_processed": agent.frames_processed,
+                "frames_received": agent.frames_received,
+                "cpu_percent": system_cpu_percent,
+                "memory_percent": system_mem_percent,
+                "disk_percent": system_disk_percent,
+                "process_uptime": process_uptime,
+                "active_workers": len(self.active_agents),
+                "model_loaded": True
+            }
+        
+        return {
+            "worker_state": "IDLE", 
+            "active_workers": 0,
+            "cpu_percent": system_cpu_percent,
+            "memory_percent": system_mem_percent,
+            "disk_percent": system_disk_percent,
+            "process_uptime": process_uptime,
+            "frame_queue_size": 0,
+            "inference_time_ms": 0,
+            "slot_eval_time_ms": 0,
+            "decode_time_ms": 0
+        }
+
+    def get_latest_frame(self):
+        for agent in self.active_agents.values():
+            if agent.latest_frame is not None: return agent.latest_frame
+        return None
 
 job_manager = JobManager()

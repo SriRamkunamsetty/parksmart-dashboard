@@ -13,10 +13,11 @@ import { toast } from 'sonner';
 
 const statusBadge = (status: string) => {
   const map: Record<string, string> = {
+    available: 'bg-green-100 text-green-700 border-green-200 hover:bg-green-100',
+    occupied: 'bg-red-100 text-red-700 border-red-200 hover:bg-red-100',
     active: 'bg-green-100 text-green-700 border-green-200 hover:bg-green-100',
     expired: 'bg-red-100 text-red-700 border-red-200 hover:bg-red-100',
     cancelled: 'bg-gray-100 text-gray-600 border-gray-200 hover:bg-gray-100',
-    occupied: 'bg-blue-100 text-blue-700 border-blue-200 hover:bg-blue-100',
     processing: 'bg-yellow-100 text-yellow-700 border-yellow-200',
     paused: 'bg-orange-100 text-orange-700 border-orange-200',
     completed: 'bg-green-100 text-green-700 border-green-200',
@@ -31,7 +32,7 @@ export default function AdminDashboard() {
     currentUser, slots, bookings, stats, isLoadingSlots, analysisStatus, ws,
     systemHealth, currentJob, activeJobId,
     logout, syncSlotsFromApi, syncStatsFromApi, syncAnalysisStatus, fetchSystemHealth, fetchBookings, connectWebSocket, updateSlot,
-    pauseJob, resumeJob, cancelJob
+    pauseJob, resumeJob, cancelJob, reseedSlots
   } = useParkingStore();
 
   const [isUploading, setIsUploading] = useState(false);
@@ -111,23 +112,19 @@ export default function AdminDashboard() {
   };
 
   const handleResetSlots = async () => {
-    try {
-      await fetch('http://localhost:8000/reset-slots', { method: 'POST' });
+    const success = await reseedSlots();
+    if (success) {
       toast.success("Parking slots reset to available");
-      triggerRefresh();
-    } catch (e) {
+    } else {
       toast.error("Failed to reset slots");
     }
   };
 
   const handleReseedSlots = async () => {
-    try {
-      const res = await fetch('http://localhost:8000/reseed-slots', { method: 'POST' });
-      if (res.ok) {
-        toast.success("S1-S7 reseeded successfully");
-        triggerRefresh();
-      }
-    } catch (e) {
+    const success = await reseedSlots();
+    if (success) {
+      toast.success("S1-S7 reseeded successfully");
+    } else {
       toast.error("Failed to reseed slots");
     }
   };
@@ -229,12 +226,12 @@ export default function AdminDashboard() {
   };
 
   const systemStats = [
-    { label: 'CPU Usage', value: systemHealth ? `${systemHealth.cpu_percent}%` : '...', icon: Cpu, color: 'text-orange-600', bg: 'bg-orange-50 border-orange-200' },
-    { label: 'Memory RAM', value: systemHealth ? `${systemHealth.memory_percent}%` : '...', icon: Server, color: 'text-indigo-600', bg: 'bg-indigo-50 border-indigo-200' },
-    { label: 'Disk IO Storage', value: systemHealth ? `${systemHealth.disk_percent}%` : '...', icon: HardDrive, color: 'text-teal-600', bg: 'bg-teal-50 border-teal-200' },
-    { label: 'Active Pipeline Jobs', value: systemHealth ? systemHealth.active_workers : '...', icon: Activity, color: 'text-pink-600', bg: 'bg-pink-50 border-pink-200' },
-    { label: 'Frame Queue Size', value: systemHealth ? systemHealth.frame_queue_size : '...', icon: Layers, color: 'text-yellow-600', bg: 'bg-yellow-50 border-yellow-200' },
-    { label: 'Process Uptime', value: systemHealth ? formatUptime(systemHealth.process_uptime) : '...', icon: Clock, color: 'text-blue-600', bg: 'bg-blue-50 border-blue-200' },
+    { label: 'CPU Usage', value: systemHealth ? `${(systemHealth.cpu_percent ?? 0).toFixed(1)}%` : '...', icon: Cpu, color: 'text-orange-600', bg: 'bg-orange-50 border-orange-200' },
+    { label: 'Memory RAM', value: systemHealth ? `${(systemHealth.memory_percent ?? 0).toFixed(1)}%` : '...', icon: Server, color: 'text-indigo-600', bg: 'bg-indigo-50 border-indigo-200' },
+    { label: 'Disk IO Storage', value: systemHealth ? `${(systemHealth.disk_percent ?? 0).toFixed(1)}%` : '...', icon: HardDrive, color: 'text-teal-600', bg: 'bg-teal-50 border-teal-200' },
+    { label: 'Active Pipeline Jobs', value: systemHealth ? (systemHealth.active_workers ?? 0) : '...', icon: Activity, color: 'text-pink-600', bg: 'bg-pink-50 border-pink-200' },
+    { label: 'Frame Queue Size', value: systemHealth ? (systemHealth.frame_queue_size ?? 0) : '...', icon: Layers, color: 'text-yellow-600', bg: 'bg-yellow-50 border-yellow-200' },
+    { label: 'Process Uptime', value: systemHealth ? formatUptime(systemHealth.process_uptime ?? 0) : '...', icon: Clock, color: 'text-blue-600', bg: 'bg-blue-50 border-blue-200' },
   ];
 
   return (
