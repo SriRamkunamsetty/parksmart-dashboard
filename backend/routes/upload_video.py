@@ -164,47 +164,67 @@ def stop_analysis(db: Session = Depends(get_db)):
         pause_job(job.job_id, db)
     return {"message": "Analysis stopped"}
 
-@router.post("/reset-slots")
-def reset_slots(db: Session = Depends(get_db)):
-    # Recreate default slots S1-S8 if missing
-    for i in range(1, 9):
-        s_id = f"S{i}"
-        slot = db.query(ParkingSlot).filter(ParkingSlot.id == s_id).first()
-        if not slot:
-            new_slot = ParkingSlot(
-                id=s_id, number=f"S-0{i}", floor="S", status="available", polygon="[]"
-            )
-            db.add(new_slot)
-        else:
-            slot.status = "available"
-            slot.polygon = "[]"
-            slot.heatmap_count = 0
-            
-    # Also reset any other slots but don't delete them
-    all_slots = db.query(ParkingSlot).all()
-    for s in all_slots:
-        is_default = False
-        if s.id.startswith("S"):
-            try:
-                num = int(s.id[1:])
-                if 1 <= num <= 8:
-                    is_default = True
-            except ValueError:
-                pass
-        
-        if is_default:
-            continue # Already handled in recreation loop
-            
-        s.status = "available"
-        s.polygon = "[]"
-        s.heatmap_count = 0
+    return {"message": "Analysis stopped"}
 
+@router.post("/api/jobs/start-demo")
+def start_demo_job(data: dict = None, db: Session = Depends(get_db)):
+    # Locate parking_video.mp4 in root
+    video_filename = "parking_video.mp4"
+    if data and "video" in data:
+        video_filename = data["video"]
+        
+    root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    video_path = os.path.join(root_dir, video_filename)
+    
+    if not os.path.exists(video_path):
+        raise HTTPException(status_code=404, detail=f"Demo video {video_filename} not found in {root_dir}")
+        
+    # Check if a job is already processing (Prevent duplicate workers)
+    existing_job = db.query(ProcessingJob).filter(
+        ProcessingJob.status == "processing"
+    ).first()
+    if existing_job:
+        return {"message": "Worker already running", "job_id": existing_job.job_id}
+
+    job_id = f"demo-{str(uuid.uuid4())[:8]}"
+    
+    # Metadata Extraction
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise HTTPException(status_code=500, detail="Could not open video file")
+        
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    duration = total_frames / fps if fps > 0 else 0
+    cap.release()
+    
+    new_job = ProcessingJob(
+        job_id=job_id,
+        video_name=video_filename,
+        video_path=video_path,
+        video_codec="h264",
+        video_width=width,
+        video_height=height,
+        total_frames=total_frames,
+        duration_seconds=duration,
+        status="processing"
+    )
+    db.add(new_job)
     db.commit()
+    db.refresh(new_job)
+        
+    job_manager.start_job(new_job.id, job_id)
     
-    # Broadcast refresh
-    manager.sync_broadcast({"event": "reload_slots"})
-    
-    return {"message": "All slots reset and default slots recreated"}
+    return {
+        "message": "Demo analysis started successfully.", 
+        "job_id": job_id,
+        "metadata": {
+            "total_frames": total_frames,
+            "duration": f"{duration:.1f}s"
+        }
+    }
 
 @router.get("/slot-stats")
 def slot_stats(db: Session = Depends(get_db)):

@@ -65,6 +65,7 @@ interface ParkingStore {
   pauseJob: (jobId: string) => Promise<boolean>;
   resumeJob: (jobId: string) => Promise<boolean>;
   cancelJob: (jobId: string) => Promise<boolean>;
+  reseedSlots: () => Promise<boolean>;
 }
 
 const mockAdminUser: User = { id: 'admin-1', name: 'Admin', email: 'admin@park.com', role: 'admin' };
@@ -155,7 +156,7 @@ export const useParkingStore = create<ParkingStore>((set, get) => ({
 
   updateSlot: async (slotId, updates) => {
     try {
-      const res = await fetch(`${API_URL}/slots/${slotId}`, {
+      const res = await fetch(`${API_URL}/api/slots/${slotId}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(updates),
@@ -167,7 +168,7 @@ export const useParkingStore = create<ParkingStore>((set, get) => ({
   syncSlotsFromApi: async (signal) => {
     try {
       set({ isLoadingSlots: true });
-      const response = await fetch(`${API_URL}/slots`, { signal });
+      const response = await fetch(`${API_URL}/api/slots`, { signal });
       if (!response.ok) throw new Error('API failed');
       const data = await response.json();
       set({ slots: data });
@@ -181,8 +182,12 @@ export const useParkingStore = create<ParkingStore>((set, get) => ({
 
   syncStatsFromApi: async () => {
     try {
-      const response = await fetch(`${API_URL}/slot-stats`);
-      if (!response.ok) throw new Error('API failed');
+      const response = await fetch(`${API_URL}/api/slots/stats`); // Updated to match consolidated router if needed, or keeping legacy
+      if (!response.ok) {
+        // Fallback to slot-stats if the prefix hasn't been moved yet
+        const fb = await fetch(`${API_URL}/slot-stats`);
+        if (fb.ok) { set({ stats: await fb.json() }); return; }
+      }
       const data = await response.json();
       set({ stats: data });
     } catch (error) { console.warn('Stats sync failed', error); }
@@ -239,6 +244,18 @@ export const useParkingStore = create<ParkingStore>((set, get) => ({
       if (res.ok) {
         set({ currentJob: null, analysisStatus: 'idle', activeJobId: null });
         await get().syncAnalysisStatus();
+        return true;
+      }
+    } catch { }
+    return false;
+  },
+
+  reseedSlots: async () => {
+    try {
+      const res = await fetch(`${API_URL}/api/slots/reseed`, { method: 'POST' });
+      if (res.ok) {
+        await get().syncSlotsFromApi();
+        await get().syncStatsFromApi();
         return true;
       }
     } catch { }
